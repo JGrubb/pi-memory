@@ -30,37 +30,98 @@ function vecBuf(vec: Float32Array): Buffer {
   return Buffer.from(vec.buffer, vec.byteOffset, vec.byteLength);
 }
 
-/**
- * Open a short-lived connection, execute fn, then close.
- * Follows memelord's pattern: Turso's embedded driver locks the file at
- * connect() time, so we keep connections brief and retry on lock contention.
- */
-async function withDb<T>(dbPath: string, fn: (db: Database) => Promise<T>): Promise<T> {
-  const maxRetries = 10;
-  const baseDelay = 50;
+// ---------------------------------------------------------------------------
+// Advisory file lock — serialises connect() across processes
+// ---------------------------------------------------------------------------
 
-  let db: Database;
-  for (let attempt = 0; ; attempt++) {
+const LOCK_STALE_MS = 30_000; // treat lock as stale after 30 s
+const LOCK_TIMEOUT_MS = 15_000; // give up waiting after 15 s
+
+function lockFilePath(dbPath: string): string {
+  return dbPath + ".lock";
+}
+
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0); // signal 0 = existence check
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function acquireLock(dbPath: string): Promise<void> {
+  const lp = lockFilePath(dbPath);
+  const start = Date.now();
+
+  while (Date.now() - start < LOCK_TIMEOUT_MS) {
     try {
-      db = await connect(dbPath);
-      break;
+      // Atomic create — fails with EEXIST if another process holds the lock
+      const fd = fs.openSync(lp, "wx");
+      fs.writeSync(fd, JSON.stringify({ pid: process.pid, ts: Date.now() }));
+      fs.closeSync(fd);
+      return; // lock acquired
     } catch (e: any) {
-      if (
-        attempt >= maxRetries ||
-        (!e.message?.includes("locked") && !e.message?.includes("Locking"))
-      ) {
-        throw e;
+      if (e.code !== "EEXIST") throw e;
+
+      // Lock file exists — check for staleness
+      try {
+        const info = JSON.parse(fs.readFileSync(lp, "utf-8"));
+        if (!isProcessAlive(info.pid) || Date.now() - info.ts > LOCK_STALE_MS) {
+          try { fs.unlinkSync(lp); } catch {}
+          continue; // retry immediately after clearing stale lock
+        }
+      } catch {
+        // Corrupt or vanished lock file — remove and retry
+        try { fs.unlinkSync(lp); } catch {}
+        continue;
       }
-      const delay = baseDelay * (1 + Math.random()) * Math.min(attempt + 1, 5);
-      await new Promise((r) => setTimeout(r, delay));
+
+      // Lock is held by a live process — back off and retry
+      await new Promise((r) => setTimeout(r, 50 + Math.random() * 150));
     }
   }
 
-  await db.exec("PRAGMA busy_timeout = 5000");
+  throw new Error(`Timed out waiting for database lock after ${LOCK_TIMEOUT_MS} ms`);
+}
+
+function releaseLock(dbPath: string): void {
   try {
+    const lp = lockFilePath(dbPath);
+    const content = fs.readFileSync(lp, "utf-8");
+    const info = JSON.parse(content);
+    // Only remove if we own it (guards against edge-case races)
+    if (info.pid === process.pid) {
+      fs.unlinkSync(lp);
+    }
+  } catch {
+    // Already gone — fine
+  }
+}
+
+/**
+ * Open a short-lived connection, execute fn, then close.
+ *
+ * An advisory lock file serialises connect() calls across processes so
+ * Turso's exclusive file lock never contends.
+ */
+async function withDb<T>(dbPath: string, fn: (db: Database) => Promise<T>): Promise<T> {
+  await acquireLock(dbPath);
+  let db: Database;
+  try {
+    db = await connect(dbPath);
+  } catch (e) {
+    releaseLock(dbPath);
+    throw e;
+  }
+
+  try {
+    await db.exec("PRAGMA journal_mode = WAL");
+    await db.exec("PRAGMA busy_timeout = 5000");
     return await fn(db);
   } finally {
     db.close();
+    releaseLock(dbPath);
   }
 }
 
