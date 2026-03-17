@@ -1,0 +1,13 @@
+{
+  "name": "pi-memory",
+  "private": true,
+  "type": "module",
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "dependencies": {
+    "@tursodatabase/database": "^0.5.1"
+  }
+}

@@ -1,0 +1,382 @@
+import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import { Box, Text } from "@mariozechner/pi-tui";
+import { Type } from "@sinclair/typebox";
+import { randomUUID } from "node:crypto";
+import * as os from "node:os";
+import * as path from "node:path";
+
+import { initDb, insertMemory, searchByVector, getStats } from "./db.js";
+import { embedText, summarizeInteraction } from "./vertex.js";
+import { buildSessionContext, formatSearchResults } from "./context.js";
+import type { Config, MemoryRecord, ExtractedContent } from "./types.js";
+
+// ---------------------------------------------------------------------------
+// Config — override with env vars as needed
+// ---------------------------------------------------------------------------
+
+const CONFIG: Config = {
+  gcpProject: process.env.GOOGLE_CLOUD_PROJECT || "ai-johngrubb",
+  region: process.env.PI_MEMORY_REGION || "global",
+  embeddingModel: process.env.PI_MEMORY_EMBED_MODEL || "gemini-embedding-001",
+  haikuModel: process.env.PI_MEMORY_HAIKU_MODEL || "claude-haiku-4-5@20251001",
+  embeddingDims: Number(process.env.PI_MEMORY_EMBED_DIMS) || 768,
+  dbPath:
+    process.env.PI_MEMORY_DB_PATH ||
+    path.join(os.homedir(), ".pi", "agent", "memory", "memory.db"),
+};
+
+// ---------------------------------------------------------------------------
+// State
+// ---------------------------------------------------------------------------
+
+let dbReady = false;
+let injectedThisSession = false;
+let cachedContext: string | null = null;
+let currentSessionId: string | null = null;
+
+// Track in-flight stores so we can await them on shutdown
+const pendingStores: Set<Promise<void>> = new Set();
+
+// ---------------------------------------------------------------------------
+// Message parsing
+// ---------------------------------------------------------------------------
+
+function extractTextParts(content: unknown): string[] {
+  if (typeof content === "string") return [content];
+  if (!Array.isArray(content)) return [];
+  return content
+    .filter((p: any) => p?.type === "text" && typeof p.text === "string")
+    .map((p: any) => p.text);
+}
+
+function extractFromMessages(messages: any[]): ExtractedContent {
+  let userPrompt = "";
+  let assistantResponse = "";
+  const filesTouched = new Set<string>();
+  const toolsUsed = new Set<string>();
+
+  for (const msg of messages) {
+    if (!msg || !msg.role) continue;
+
+    if (msg.role === "user") {
+      const parts = extractTextParts(msg.content);
+      if (parts.length > 0) userPrompt = parts.join("\n").trim();
+    } else if (msg.role === "assistant") {
+      const parts = extractTextParts(msg.content);
+      assistantResponse += parts.join("\n").trim() + "\n";
+
+      // Extract tool calls from assistant content
+      if (Array.isArray(msg.content)) {
+        for (const part of msg.content) {
+          if (part?.type === "toolCall" && part.name) {
+            toolsUsed.add(part.name);
+            const args = part.arguments ?? part.input ?? {};
+            if (args.path) filesTouched.add(args.path);
+          }
+        }
+      }
+    } else if (msg.role === "toolResult") {
+      if (msg.toolName) toolsUsed.add(msg.toolName);
+    }
+  }
+
+  return {
+    userPrompt,
+    assistantResponse: assistantResponse.trim().slice(0, 2000),
+    filesTouched: Array.from(filesTouched),
+    toolsUsed: Array.from(toolsUsed),
+  };
+}
+
+/**
+ * Build a truncated conversation string suitable for sending to Haiku.
+ */
+function buildConversationText(messages: any[]): string {
+  const parts: string[] = [];
+
+  for (const msg of messages) {
+    if (!msg?.role) continue;
+
+    if (msg.role === "user") {
+      const text = extractTextParts(msg.content).join("\n").trim();
+      if (text) parts.push(`User: ${text}`);
+    } else if (msg.role === "assistant") {
+      const text = extractTextParts(msg.content).join("\n").trim();
+      if (text) parts.push(`Assistant: ${text}`);
+
+      if (Array.isArray(msg.content)) {
+        for (const part of msg.content) {
+          if (part?.type === "toolCall" && part.name) {
+            const argsStr = JSON.stringify(part.arguments ?? part.input ?? {}).slice(0, 200);
+            parts.push(`[Tool: ${part.name}(${argsStr})]`);
+          }
+        }
+      }
+    }
+  }
+
+  const full = parts.join("\n\n");
+  return full.length > 6000 ? full.slice(0, 6000) + "\n...[truncated]" : full;
+}
+
+// ---------------------------------------------------------------------------
+// Background memory storage
+// ---------------------------------------------------------------------------
+
+async function processAndStore(
+  messages: any[],
+  cwd: string,
+  sessionId: string,
+): Promise<void> {
+  const extracted = extractFromMessages(messages);
+
+  // Skip trivial interactions (very short prompts with no tool use)
+  if (extracted.userPrompt.length < 20 && extracted.toolsUsed.length === 0) {
+    return;
+  }
+
+  const conversationText = buildConversationText(messages);
+  if (conversationText.trim().length < 50) return;
+
+  // Step 1: Summarize with Haiku
+  let summary: string;
+  let topics: string[];
+  try {
+    const result = await summarizeInteraction(conversationText, CONFIG);
+    summary = result.summary;
+    topics = result.topics;
+  } catch (err) {
+    console.error("[memory] Summarization failed, using fallback:", err);
+    summary = extracted.userPrompt.slice(0, 300);
+    topics = [];
+  }
+
+  // Step 2: Embed the summary
+  let embedding: Float32Array;
+  try {
+    embedding = await embedText(summary, CONFIG, "RETRIEVAL_DOCUMENT");
+  } catch (err) {
+    console.error("[memory] Embedding failed, storing with zero vector:", err);
+    embedding = new Float32Array(CONFIG.embeddingDims);
+  }
+
+  // Step 3: Store in DB
+  const record: MemoryRecord = {
+    id: randomUUID(),
+    sessionId,
+    timestamp: Date.now(),
+    cwd,
+    summary,
+    topics,
+    filesTouched: extracted.filesTouched,
+    toolsUsed: extracted.toolsUsed,
+    userPrompt: extracted.userPrompt.slice(0, 500),
+    responseSnippet: extracted.assistantResponse.slice(0, 500),
+  };
+
+  await insertMemory(CONFIG.dbPath, record, embedding);
+}
+
+// ---------------------------------------------------------------------------
+// Extension
+// ---------------------------------------------------------------------------
+
+export default function (pi: ExtensionAPI) {
+  // -------------------------------------------------------------------------
+  // Session start: init DB, build context from previous sessions
+  // -------------------------------------------------------------------------
+
+  pi.on("session_start", async (_event, ctx) => {
+    injectedThisSession = false;
+    cachedContext = null;
+    currentSessionId = ctx.sessionManager.getSessionFile() ?? randomUUID();
+
+    try {
+      await initDb(CONFIG.dbPath);
+      dbReady = true;
+    } catch (err) {
+      console.error("[memory] DB init failed:", err);
+      dbReady = false;
+      return;
+    }
+
+    try {
+      cachedContext = await buildSessionContext(CONFIG.dbPath, ctx.cwd, currentSessionId);
+      if (cachedContext) {
+        const stats = await getStats(CONFIG.dbPath);
+        ctx.ui.notify(
+          `🧠 Memory loaded: ${stats.totalMemories} memories across ${stats.distinctProjects} projects`,
+          "info",
+        );
+      }
+    } catch (err) {
+      console.error("[memory] Context build failed:", err);
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // Session switch (/new, /resume): rebuild context
+  // -------------------------------------------------------------------------
+
+  pi.on("session_switch", async (_event, ctx) => {
+    injectedThisSession = false;
+    currentSessionId = ctx.sessionManager.getSessionFile() ?? randomUUID();
+
+    if (!dbReady) return;
+
+    try {
+      cachedContext = await buildSessionContext(CONFIG.dbPath, ctx.cwd, currentSessionId);
+    } catch (err) {
+      console.error("[memory] Context rebuild failed:", err);
+      cachedContext = null;
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // Before agent start: inject memory context on first prompt only
+  // -------------------------------------------------------------------------
+
+  pi.on("before_agent_start", async (_event, _ctx) => {
+    if (injectedThisSession || !cachedContext) return;
+    injectedThisSession = true;
+
+    return {
+      message: {
+        customType: "memory-context",
+        content: cachedContext,
+        display: true,
+      },
+    };
+  });
+
+  // -------------------------------------------------------------------------
+  // Renderer: show memory context as a labeled block
+  // -------------------------------------------------------------------------
+
+  pi.registerMessageRenderer("memory-context", (message, _options, theme) => {
+    const header = theme.fg("accent", theme.bold("🧠 Session Memory"));
+    const body = String(message.content);
+    const lines = `${header}\n${body}`;
+
+    const box = new Box(1, 1, (t: string) => theme.bg("customMessageBg", t));
+    box.addChild(new Text(lines, 0, 0));
+    return box;
+  });
+
+  // -------------------------------------------------------------------------
+  // Agent end: fire-and-forget memory extraction
+  // -------------------------------------------------------------------------
+
+  pi.on("agent_end", async (event, ctx) => {
+    if (!dbReady) return;
+
+    const messages = event.messages;
+    const cwd = ctx.cwd;
+    const sessionId = currentSessionId ?? "unknown";
+
+    const promise = processAndStore(messages, cwd, sessionId).catch((err) =>
+      console.error("[memory] Background store failed:", err),
+    );
+
+    pendingStores.add(promise);
+    promise.finally(() => pendingStores.delete(promise));
+  });
+
+  // -------------------------------------------------------------------------
+  // Shutdown: wait for pending stores
+  // -------------------------------------------------------------------------
+
+  pi.on("session_shutdown", async () => {
+    if (pendingStores.size > 0) {
+      await Promise.allSettled(Array.from(pendingStores));
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // Tool: memory_search
+  // -------------------------------------------------------------------------
+
+  pi.registerTool({
+    name: "memory_search",
+    label: "Search Memory",
+    description: "Search past coding session memories by semantic similarity",
+    promptSnippet:
+      "Search past coding session memories for relevant context, decisions, and patterns",
+    promptGuidelines: [
+      "Use memory_search when the user references past work, asks 'did we already...', or when you need context about previous decisions in this or related projects.",
+    ],
+    parameters: Type.Object({
+      query: Type.String({ description: "What to search for — describe the topic or concept" }),
+      limit: Type.Optional(
+        Type.Number({ description: "Max results to return (default 10)" }),
+      ),
+      project_filter: Type.Optional(
+        Type.String({
+          description: "Filter to a specific project directory path, or omit for all projects",
+        }),
+      ),
+    }),
+
+    async execute(_toolCallId, params, _signal) {
+      if (!dbReady) {
+        throw new Error("Memory database not initialized");
+      }
+
+      let queryEmbedding: Float32Array;
+      try {
+        queryEmbedding = await embedText(params.query, CONFIG, "RETRIEVAL_QUERY");
+      } catch (err) {
+        throw new Error(`Failed to embed query: ${err}`);
+      }
+
+      const results = await searchByVector(
+        CONFIG.dbPath,
+        queryEmbedding,
+        params.limit ?? 10,
+        params.project_filter,
+      );
+
+      return {
+        content: [{ type: "text", text: formatSearchResults(results) }],
+        details: { count: results.length },
+      };
+    },
+  });
+
+  // -------------------------------------------------------------------------
+  // Command: /memory
+  // -------------------------------------------------------------------------
+
+  pi.registerCommand("memory", {
+    description: "Show memory system stats and recent memories",
+    handler: async (_args, ctx) => {
+      if (!dbReady) {
+        ctx.ui.notify("Memory system not initialized", "warning");
+        return;
+      }
+
+      try {
+        const stats = await getStats(CONFIG.dbPath);
+
+        const lines = [
+          `🧠 Memory System Stats`,
+          `  Memories: ${stats.totalMemories}`,
+          `  Projects: ${stats.distinctProjects}`,
+          `  Sessions: ${stats.distinctSessions}`,
+        ];
+
+        if (stats.oldestTimestamp) {
+          lines.push(`  Oldest: ${new Date(stats.oldestTimestamp).toLocaleDateString()}`);
+        }
+        if (stats.newestTimestamp) {
+          lines.push(`  Newest: ${new Date(stats.newestTimestamp).toLocaleDateString()}`);
+        }
+        lines.push(`  DB: ${CONFIG.dbPath}`);
+
+        ctx.ui.notify(lines.join("\n"), "info");
+      } catch (err) {
+        ctx.ui.notify(`Memory error: ${err}`, "error");
+      }
+    },
+  });
+}
