@@ -7,67 +7,86 @@ This extension enables semantic search across coding sessions, automatically sto
 ## Features
 
 - **Session Memory**: Automatically captures summaries and topics from each coding session
-- **Semantic Search**: Search past work using natural language queries with vector embeddings
+- **Semantic Search**: Search past work using natural language queries via `vec0` KNN index
 - **Project Filtering**: Scope searches to specific projects or search across all projects
-- **Persistent Storage**: Uses Turso SQLite for reliable memory persistence
+- **Persistent Storage**: Uses SQLite with [sqlite-vec](https://github.com/asg017/sqlite-vec) for vector search
+- **Multi-session Safe**: WAL mode + `better-sqlite3` allows concurrent access from multiple pi sessions
 - **Custom Tool Integration**: Provides `memory_search` tool for use in agent prompts
 
 ## Installation
 
-1. Place this extension in your pi extensions directory:
+```bash
+# Clone into pi's extensions directory
+git clone https://github.com/JGrubb/pi-memory.git ~/.pi/agent/extensions/memory
+
+# Install dependencies
+cd ~/.pi/agent/extensions/memory
+npm install
+```
+
+## Configuration
+
+Set the following environment variables (e.g. in your shell profile):
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `GOOGLE_CLOUD_PROJECT` | **Yes** | — | GCP project with Vertex AI API enabled |
+| `PI_MEMORY_REGION` | No | `global` | Vertex AI region |
+| `PI_MEMORY_EMBED_MODEL` | No | `gemini-embedding-001` | Embedding model |
+| `PI_MEMORY_HAIKU_MODEL` | No | `claude-haiku-4-5@20251001` | Summarization model |
+| `PI_MEMORY_EMBED_DIMS` | No | `768` | Embedding dimensions |
+| `PI_MEMORY_DB_PATH` | No | `~/.pi/agent/memory/memory.db` | Database file path |
+
+### GCP Setup
+
+1. Enable the Vertex AI API in your GCP project
+2. Ensure your account has the `aiplatform.endpoints.predict` permission (e.g. `roles/aiplatform.user`)
+3. Set up Application Default Credentials:
    ```bash
-   cp -r pi-memory ~/.pi/agent/extensions/
+   gcloud auth application-default login
    ```
-
-2. Add to your `.pirc.yaml` or pi config:
-   ```yaml
-   extensions:
-     - ./extensions/memory
+4. Export your project:
+   ```bash
+   export GOOGLE_CLOUD_PROJECT=your-gcp-project-id
    ```
-
-3. Reload pi to activate the extension
 
 ## Usage
 
-Once installed, the `memory_search` tool is available for use in your pi agent:
+Once installed and configured, start/restart pi. The extension auto-loads on session start.
+
+### `memory_search` tool
+
+Available in agent prompts for semantic search across past sessions:
 
 ```
-memory_search(query: string, limit?: number = 10, project_filter?: string)
+memory_search(query: string, limit?: number, project_filter?: string)
 ```
 
-### Examples
+### `/memory` command
 
-Search across all sessions:
-```
-memory_search("database performance optimization")
-```
-
-Search within a specific project:
-```
-memory_search("authentication issues", project_filter: "/Users/johngrubb/my-project")
-```
-
-Return top 5 most relevant memories:
-```
-memory_search("API integration", limit: 5)
-```
+Shows memory system stats (total memories, projects, sessions, date range).
 
 ## Architecture
 
-- **index.ts**: Extension entry point, memory tool registration, session memory capture
-- **db.ts**: Turso database management, vector storage, semantic search
-- **vertex.ts**: Google Vertex AI integration for embedding generation
-- **context.ts**: Memory context rendering for agent prompts
+- **index.ts**: Extension entry point, tool/command registration, session lifecycle hooks
+- **db.ts**: SQLite + sqlite-vec database layer with connection caching and KNN search
+- **vertex.ts**: Google Vertex AI integration (embeddings + summarization)
+- **context.ts**: Session context builder and search result formatting
 - **types.ts**: TypeScript type definitions
 
-## Database
+### Database
 
-Memories are stored in a Turso SQLite database at `~/.pi/agent/memory/` with vector embeddings (768-dimensional via Vertex AI Embeddings API).
+Memories are stored in SQLite at `~/.pi/agent/memory/memory.db`:
 
-## Requirements
+- **`memories`** table: metadata (id, summary, topics, timestamps, cwd, etc.)
+- **`vec_memories`** virtual table: `vec0` with 768-dim float embeddings, cosine distance metric, `cwd` metadata column for filtered KNN queries
 
-- Google Cloud credentials with Vertex AI access
-- Turso database URL and auth token
+## Development
+
+```bash
+# Run tests (36 tests)
+npx tsx --test test/*.test.ts
+```
 
 ## License
 

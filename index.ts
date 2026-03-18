@@ -11,11 +11,18 @@ import { buildSessionContext, formatSearchResults } from "./context.js";
 import type { Config, MemoryRecord, ExtractedContent } from "./types.js";
 
 // ---------------------------------------------------------------------------
-// Config — override with env vars as needed
+// Config — set via env vars. GOOGLE_CLOUD_PROJECT is required.
+//
+//   GOOGLE_CLOUD_PROJECT  — GCP project with Vertex AI enabled (required)
+//   PI_MEMORY_REGION      — Vertex AI region (default: "global")
+//   PI_MEMORY_EMBED_MODEL — embedding model (default: "gemini-embedding-001")
+//   PI_MEMORY_HAIKU_MODEL — summarization model (default: "claude-haiku-4-5@20251001")
+//   PI_MEMORY_EMBED_DIMS  — embedding dimensions (default: 768)
+//   PI_MEMORY_DB_PATH     — database file path (default: ~/.pi/agent/memory/memory.db)
 // ---------------------------------------------------------------------------
 
 const CONFIG: Config = {
-  gcpProject: process.env.GOOGLE_CLOUD_PROJECT || "ai-johngrubb",
+  gcpProject: process.env.GOOGLE_CLOUD_PROJECT ?? "",
   region: process.env.PI_MEMORY_REGION || "global",
   embeddingModel: process.env.PI_MEMORY_EMBED_MODEL || "gemini-embedding-001",
   haikuModel: process.env.PI_MEMORY_HAIKU_MODEL || "claude-haiku-4-5@20251001",
@@ -190,6 +197,16 @@ export default function (pi: ExtensionAPI) {
     injectedThisSession = false;
     cachedContext = null;
     currentSessionId = ctx.sessionManager.getSessionFile() ?? randomUUID();
+
+    if (!CONFIG.gcpProject) {
+      console.error(
+        "[memory] GOOGLE_CLOUD_PROJECT env var is not set. " +
+        "Set it to a GCP project with Vertex AI enabled. " +
+        "Memory extension disabled.",
+      );
+      dbReady = false;
+      return;
+    }
 
     try {
       await initDb(CONFIG.dbPath);
