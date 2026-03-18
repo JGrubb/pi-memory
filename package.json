@@ -8,6 +8,10 @@
     ]
   },
   "dependencies": {
-    "@tursodatabase/database": "^0.5.1"
+    "better-sqlite3": "^12.8.0",
+    "sqlite-vec": "^0.1.7"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13"
   }
 }
