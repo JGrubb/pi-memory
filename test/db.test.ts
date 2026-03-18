@@ -11,6 +11,7 @@ import {
   getRecentForCwd,
   getRecentCrossProject,
   getStats,
+  closeAll,
 } from "../db.js";
 import type { MemoryRecord } from "../types.js";
 
@@ -69,6 +70,7 @@ describe("Database", () => {
   });
 
   afterEach(() => {
+    closeAll();
     if (tmpDir && fs.existsSync(tmpDir)) {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
