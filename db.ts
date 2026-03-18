@@ -127,6 +127,7 @@ export async function insertMemory(
           record.sessionId,
           record.timestamp,
           record.cwd,
+          record.summary,
           JSON.stringify(record.topics),
           JSON.stringify(record.filesTouched),
           JSON.stringify(record.toolsUsed),
