@@ -2,7 +2,7 @@ import { execSync } from "node:child_process";
 import type { Config } from "./types.js";
 
 // ---------------------------------------------------------------------------
-// GCP Auth — cache ADC token, refresh after 45 min
+// Auth — GCP (Vertex AI) or Anthropic API
 // ---------------------------------------------------------------------------
 
 let cachedToken: { token: string; expiresAt: number } | null = null;
@@ -23,6 +23,14 @@ export function clearTokenCache(): void {
   cachedToken = null;
 }
 
+function getAnthropicApiKey(): string {
+  const key = process.env.ANTHROPIC_API_KEY;
+  if (!key) {
+    throw new Error("ANTHROPIC_API_KEY env var not set");
+  }
+  return key;
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -33,11 +41,17 @@ function vertexUrl(config: Config, publisher: string, model: string, method: str
     region === "global"
       ? "aiplatform.googleapis.com"
       : `${region}-aiplatform.googleapis.com`;
+  const isGoogle = publisher === "google";
+  // For Google models (Gemini), the URL structure is different
+  if (isGoogle) {
+    return `https://${host}/v1/projects/${config.gcpProject}/locations/${region}/publishers/google/models/${model}:${method}`;
+  }
   return `https://${host}/v1/projects/${config.gcpProject}/locations/${region}/publishers/${publisher}/models/${model}:${method}`;
 }
 
-async function vertexFetch(url: string, body: object): Promise<any> {
+async function vertexFetch(url: string, body: object, isEmbed: boolean = false): Promise<any> {
   const token = getAccessToken();
+  // console.log(`Fetching URL: ${url}`);
   const res = await fetch(url, {
     method: "POST",
     headers: {
@@ -51,6 +65,26 @@ async function vertexFetch(url: string, body: object): Promise<any> {
     // If auth expired, clear cache so next call refreshes
     if (res.status === 401) clearTokenCache();
     throw new Error(`Vertex AI ${res.status}: ${text}`);
+  }
+  const data = await res.json();
+  if (isEmbed) return data;
+  return Array.isArray(data) ? data[0] : data;
+}
+
+async function anthropicFetch(body: object): Promise<any> {
+  const apiKey = getAnthropicApiKey();
+  const res = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "x-api-key": apiKey,
+      "anthropic-version": "2023-06-01",
+      "content-type": "application/json",
+    },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Anthropic API ${res.status}: ${text}`);
   }
   return res.json();
 }
@@ -68,7 +102,7 @@ export async function embedText(
   const data = await vertexFetch(url, {
     instances: [{ content: text, task_type: taskType }],
     parameters: { outputDimensionality: config.embeddingDims },
-  });
+  }, true);
   const values: number[] = data.predictions[0].embeddings.values;
   return new Float32Array(values);
 }
@@ -95,18 +129,33 @@ export async function summarizeInteraction(
   conversationText: string,
   config: Config,
 ): Promise<{ summary: string; topics: string[] }> {
-  const url = vertexUrl(config, "anthropic", config.haikuModel, "rawPredict");
+  const isAnthropic = config.haikuModel.includes("claude");
   const prompt = EXTRACTION_PROMPT.replace("{{CONVERSATION}}", conversationText);
 
-  const data = await vertexFetch(url, {
-    anthropic_version: "vertex-2023-10-16",
-    messages: [{ role: "user", content: prompt }],
-    max_tokens: 512,
-  });
+  let raw: string;
 
-  const raw: string = data.content[0].text;
+  if (isAnthropic) {
+    // Claude/Haiku: use Anthropic API directly (no Vertex quota limits)
+    const data = await anthropicFetch({
+      model: config.haikuModel,
+      max_tokens: 512,
+      messages: [{ role: "user", content: prompt }],
+    });
+    raw = data.content[0].text;
+  } else {
+    // Gemini: use Vertex AI
+    const url = vertexUrl(config, "google", config.haikuModel, "streamGenerateContent");
+    const data = await vertexFetch(url, {
+      contents: [{ role: "user", parts: [{ text: prompt }] }],
+      generationConfig: {
+        maxOutputTokens: 512,
+        temperature: 0.1,
+      },
+    });
+    raw = data[0].candidates[0].content.parts[0].text;
+  }
 
-  // Strip markdown fencing if Haiku wrapped the JSON
+  // Strip markdown fencing if model wrapped the JSON
   const text = raw.replace(/^```(?:json)?\s*\n?/i, "").replace(/\n?```\s*$/i, "").trim();
 
   try {
@@ -116,7 +165,7 @@ export async function summarizeInteraction(
       topics: Array.isArray(parsed.topics) ? parsed.topics : [],
     };
   } catch {
-    // If Haiku didn't return valid JSON, use the raw text as summary
+    // If model didn't return valid JSON, use the raw text as summary
     return { summary: text.slice(0, 500), topics: [] };
   }
 }
