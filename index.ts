@@ -235,7 +235,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => {
     injectedThisSession = false;
     cachedContext = null;
-    currentSessionId = ctx.sessionManager.getSessionFile() ?? randomUUID();
+    currentSessionId = ctx.sessionManager.getSessionId() ?? randomUUID();
 
     if (!CONFIG.gcpProject) {
       console.error(
@@ -282,7 +282,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_switch", async (_event, ctx) => {
     injectedThisSession = false;
-    currentSessionId = ctx.sessionManager.getSessionFile() ?? randomUUID();
+    currentSessionId = ctx.sessionManager.getSessionId() ?? randomUUID();
 
     if (!dbReady) return;
 
