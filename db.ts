@@ -2,7 +2,7 @@ import Database from "better-sqlite3";
 import * as sqliteVec from "sqlite-vec";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import type { MemoryRecord, SearchResult } from "./types.js";
+import type { MemoryRecord, MemoryStatus, SearchResult } from "./types.js";
 
 // ---------------------------------------------------------------------------
 // Schema
@@ -20,13 +20,23 @@ CREATE TABLE IF NOT EXISTS memories (
     files_touched   TEXT,
     tools_used      TEXT,
     user_prompt     TEXT,
-    response_snippet TEXT
+    response_snippet TEXT,
+    status          TEXT NOT NULL DEFAULT 'complete',
+    raw_text        TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_memories_cwd ON memories(cwd);
 CREATE INDEX IF NOT EXISTS idx_memories_ts ON memories(timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_memories_session ON memories(session_id);
+CREATE INDEX IF NOT EXISTS idx_memories_status ON memories(status);
 `;
+
+// Migrations for existing databases that predate new columns
+const MIGRATIONS = [
+  `ALTER TABLE memories ADD COLUMN status TEXT NOT NULL DEFAULT 'complete'`,
+  `ALTER TABLE memories ADD COLUMN raw_text TEXT`,
+  `CREATE INDEX IF NOT EXISTS idx_memories_status ON memories(status)`,
+];
 
 // vec0 virtual table — cosine distance, with cwd as a metadata column for
 // filtered KNN queries. Rowids match the memories table.
@@ -104,6 +114,17 @@ export async function initDb(dbPath: string): Promise<void> {
   const db = getDb(dbPath);
   db.exec(MEMORIES_TABLE);
   db.exec(VEC_TABLE);
+
+  // Run migrations — each is safe to ignore if the column already exists
+  for (const sql of MIGRATIONS) {
+    try {
+      db.exec(sql);
+    } catch (e: any) {
+      if (!e.message?.includes("duplicate column name") && !e.message?.includes("already exists")) {
+        throw e;
+      }
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -120,15 +141,17 @@ export async function insertMemory(
     // Upsert into memories table
     db.prepare(
       `INSERT INTO memories
-       (id, session_id, timestamp, cwd, summary, topics, files_touched, tools_used, user_prompt, response_snippet)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       (id, session_id, timestamp, cwd, summary, topics, files_touched, tools_used, user_prompt, response_snippet, status, raw_text)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(id) DO UPDATE SET
          summary = excluded.summary,
          topics = excluded.topics,
          files_touched = excluded.files_touched,
          tools_used = excluded.tools_used,
          user_prompt = excluded.user_prompt,
-         response_snippet = excluded.response_snippet`,
+         response_snippet = excluded.response_snippet,
+         status = excluded.status,
+         raw_text = excluded.raw_text`,
     ).run(
       record.id,
       record.sessionId,
@@ -140,6 +163,8 @@ export async function insertMemory(
       JSON.stringify(record.toolsUsed),
       record.userPrompt,
       record.responseSnippet,
+      record.status,
+      record.rawText,
     );
 
     // Get the rowid (works for both insert and update)
@@ -326,6 +351,69 @@ export async function getRecentCrossProject(
     userPrompt: r.user_prompt ?? "",
     distance: 0,
   }));
+}
+
+// ---------------------------------------------------------------------------
+// Pending record retry support
+// ---------------------------------------------------------------------------
+
+export interface PendingRecord {
+  id: string;
+  rowid: number;
+  rawText: string;
+  summary: string;  // existing (may be fallback) — used if status is pending_embed
+  status: MemoryStatus;
+}
+
+export async function getPendingRecords(dbPath: string): Promise<PendingRecord[]> {
+  const db = getDb(dbPath);
+  const rows = db
+    .prepare(
+      `SELECT rowid, id, raw_text, summary, status
+       FROM memories
+       WHERE status != 'complete'
+       ORDER BY timestamp ASC`,
+    )
+    .all() as any[];
+
+  return rows.map((r) => ({
+    id: r.id,
+    rowid: r.rowid,
+    rawText: r.raw_text ?? "",
+    summary: r.summary,
+    status: r.status as MemoryStatus,
+  }));
+}
+
+export async function updateMemoryAfterRetry(
+  dbPath: string,
+  id: string,
+  rowid: number,
+  summary: string,
+  topics: string[],
+  embedding: Float32Array,
+): Promise<void> {
+  const db = getDb(dbPath);
+  const trx = db.transaction(() => {
+    db.prepare(
+      `UPDATE memories SET summary = ?, topics = ?, status = 'complete' WHERE id = ?`,
+    ).run(summary, JSON.stringify(topics), id);
+
+    try {
+      db.prepare("DELETE FROM vec_memories WHERE rowid = ?").run(rowid);
+    } catch (e: any) {
+      if (e.code !== "SQLITE_DONE") throw e;
+    }
+    const cwdRow = db.prepare("SELECT cwd FROM memories WHERE id = ?").get(id) as { cwd: string } | undefined;
+    try {
+      db.prepare(
+        "INSERT INTO vec_memories(rowid, embedding, cwd) VALUES (?, ?, ?)",
+      ).run(BigInt(rowid), vecBuf(embedding), cwdRow?.cwd ?? "");
+    } catch (e: any) {
+      if (!e.message?.includes("UNIQUE constraint")) throw e;
+    }
+  });
+  trx();
 }
 
 // ---------------------------------------------------------------------------

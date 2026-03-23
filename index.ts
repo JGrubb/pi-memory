@@ -5,7 +5,7 @@ import { randomUUID } from "node:crypto";
 import * as os from "node:os";
 import * as path from "node:path";
 
-import { initDb, insertMemory, searchByVector, getStats } from "./db.js";
+import { initDb, insertMemory, searchByVector, getStats, getPendingRecords, updateMemoryAfterRetry } from "./db.js";
 import { embedText, summarizeInteraction } from "./vertex.js";
 import { buildSessionContext, formatSearchResults } from "./context.js";
 import type { Config, MemoryRecord, ExtractedContent } from "./types.js";
@@ -147,17 +147,19 @@ async function processAndStore(
   const conversationText = buildConversationText(messages);
   if (conversationText.trim().length < 50) return;
 
-  // Step 1: Summarize with Haiku
+  // Step 1: Summarize
   let summary: string;
   let topics: string[];
+  let status: MemoryRecord["status"] = "complete";
   try {
     const result = await summarizeInteraction(conversationText, CONFIG);
     summary = result.summary;
     topics = result.topics;
   } catch (err) {
-    console.error("[memory] Summarization failed, using fallback:", err);
+    console.error("[memory] Summarization failed, will retry on next session start:", err);
     summary = extracted.userPrompt.slice(0, 300);
     topics = [];
+    status = "pending";
   }
 
   // Step 2: Embed the summary
@@ -165,8 +167,9 @@ async function processAndStore(
   try {
     embedding = await embedText(summary, CONFIG, "RETRIEVAL_DOCUMENT");
   } catch (err) {
-    console.error("[memory] Embedding failed, storing with zero vector:", err);
+    console.error("[memory] Embedding failed, will retry on next session start:", err);
     embedding = new Float32Array(CONFIG.embeddingDims);
+    if (status === "complete") status = "pending_embed";
   }
 
   // Step 3: Store in DB
@@ -181,9 +184,43 @@ async function processAndStore(
     toolsUsed: extracted.toolsUsed,
     userPrompt: extracted.userPrompt.slice(0, 500),
     responseSnippet: extracted.assistantResponse.slice(0, 500),
+    status,
+    rawText: conversationText,
   };
 
   await insertMemory(CONFIG.dbPath, record, embedding);
+}
+
+// ---------------------------------------------------------------------------
+// Backfill — retry records that failed summarization or embedding
+// ---------------------------------------------------------------------------
+
+async function retryPendingRecords(): Promise<void> {
+  if (!dbReady) return;
+  const pending = await getPendingRecords(CONFIG.dbPath);
+  if (pending.length === 0) return;
+
+  console.log(`[memory] Retrying ${pending.length} pending record(s)...`);
+
+  for (const record of pending) {
+    try {
+      let summary = record.summary;
+      let topics: string[] = [];
+
+      if (record.status === "pending") {
+        // Need to re-summarize (and then embed)
+        const text = record.rawText || record.summary; // rawText preferred
+        const result = await summarizeInteraction(text, CONFIG);
+        summary = result.summary;
+        topics = result.topics;
+      }
+
+      const embedding = await embedText(summary, CONFIG, "RETRIEVAL_DOCUMENT");
+      await updateMemoryAfterRetry(CONFIG.dbPath, record.id, record.rowid, summary, topics, embedding);
+    } catch (err) {
+      console.error(`[memory] Retry failed for record ${record.id}, will try again next session:`, err);
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -231,6 +268,12 @@ export default function (pi: ExtensionAPI) {
     } catch (err) {
       console.error("[memory] Context build failed:", err);
     }
+
+    // Kick off backfill for any pending records — fire and forget so startup
+    // isn't blocked. Records that fail again remain pending for the next start.
+    retryPendingRecords().catch((err) =>
+      console.error("[memory] Backfill failed:", err),
+    );
   });
 
   // -------------------------------------------------------------------------

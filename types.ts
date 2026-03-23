@@ -1,3 +1,5 @@
+export type MemoryStatus = "complete" | "pending" | "pending_embed";
+
 export interface MemoryRecord {
   id: string;
   sessionId: string;
@@ -9,6 +11,8 @@ export interface MemoryRecord {
   toolsUsed: string[];
   userPrompt: string;
   responseSnippet: string;
+  status: MemoryStatus;
+  rawText: string;
 }
 
 export interface SearchResult {
