@@ -269,6 +269,26 @@ describe("Database", () => {
       assert.equal(results[0].id, "previous");
     });
 
+    it("includes records with null session_id when excluding a session", async () => {
+      await initDb(dbPath);
+
+      await insertMemory(
+        dbPath,
+        makeRecord({ id: "current", sessionId: "current-session", cwd: "/project" }),
+        makeEmbedding(768, 1),
+      );
+      // Simulate legacy records whose session_id was reset to null (the migration scenario)
+      await insertMemory(
+        dbPath,
+        makeRecord({ id: "legacy", sessionId: null as any, cwd: "/project", timestamp: Date.now() - 1000 }),
+        makeEmbedding(768, 3),
+      );
+
+      const results = await getRecentForCwd(dbPath, "/project", "current-session", 10);
+      assert.equal(results.length, 1);
+      assert.equal(results[0].id, "legacy");
+    });
+
     it("respects the limit", async () => {
       await initDb(dbPath);
 

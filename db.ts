@@ -288,7 +288,7 @@ export async function getRecentForCwd(
     sql = `
       SELECT id, summary, cwd, timestamp, topics, files_touched, user_prompt
       FROM memories
-      WHERE cwd = ? AND session_id != ?
+      WHERE cwd = ? AND (session_id IS NULL OR session_id != ?)
       ORDER BY timestamp DESC
       LIMIT ?
     `;
