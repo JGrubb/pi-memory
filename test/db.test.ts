@@ -11,6 +11,8 @@ import {
   getRecentForCwd,
   getRecentCrossProject,
   getStats,
+  getPendingRecords,
+  updateMemoryAfterRetry,
   closeAll,
 } from "../db.js";
 import type { MemoryRecord } from "../types.js";
@@ -356,6 +358,112 @@ describe("Database", () => {
 
       const results = await getRecentCrossProject(dbPath, "/only-project", 10);
       assert.equal(results.length, 0);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // getPendingRecords
+  // -------------------------------------------------------------------------
+
+  describe("getPendingRecords", () => {
+    it("returns nothing when all records are complete", async () => {
+      await initDb(dbPath);
+      await insertMemory(dbPath, makeRecord({ id: "m1", status: "complete" }), makeEmbedding(768, 1));
+      await insertMemory(dbPath, makeRecord({ id: "m2", status: "complete" }), makeEmbedding(768, 2));
+
+      const pending = await getPendingRecords(dbPath);
+      assert.equal(pending.length, 0);
+    });
+
+    it("returns records with status=pending", async () => {
+      await initDb(dbPath);
+      await insertMemory(dbPath, makeRecord({ id: "ok", status: "complete" }), makeEmbedding(768, 1));
+      await insertMemory(dbPath, makeRecord({ id: "bad", status: "pending", summary: "fallback prompt text", rawText: "User: do something\nAssistant: sure" }), makeEmbedding(768, 2));
+
+      const pending = await getPendingRecords(dbPath);
+      assert.equal(pending.length, 1);
+      assert.equal(pending[0].id, "bad");
+      assert.equal(pending[0].status, "pending");
+      assert.equal(pending[0].rawText, "User: do something\nAssistant: sure");
+    });
+
+    it("returns records with status=pending_embed", async () => {
+      await initDb(dbPath);
+      await insertMemory(dbPath, makeRecord({ id: "m1", status: "pending_embed", summary: "good summary", topics: ["dbt"] }), makeEmbedding(768, 0));
+
+      const pending = await getPendingRecords(dbPath);
+      assert.equal(pending.length, 1);
+      assert.equal(pending[0].status, "pending_embed");
+      assert.equal(pending[0].summary, "good summary");
+    });
+
+    it("returns all non-complete records ordered oldest first", async () => {
+      await initDb(dbPath);
+      const now = Date.now();
+      await insertMemory(dbPath, makeRecord({ id: "newest", status: "pending", timestamp: now }), makeEmbedding(768, 1));
+      await insertMemory(dbPath, makeRecord({ id: "oldest", status: "pending", timestamp: now - 10000 }), makeEmbedding(768, 2));
+      await insertMemory(dbPath, makeRecord({ id: "complete", status: "complete", timestamp: now - 5000 }), makeEmbedding(768, 3));
+
+      const pending = await getPendingRecords(dbPath);
+      assert.equal(pending.length, 2);
+      assert.equal(pending[0].id, "oldest");
+      assert.equal(pending[1].id, "newest");
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // updateMemoryAfterRetry
+  // -------------------------------------------------------------------------
+
+  describe("updateMemoryAfterRetry", () => {
+    it("sets status to complete and updates summary and topics", async () => {
+      await initDb(dbPath);
+      await insertMemory(
+        dbPath,
+        makeRecord({ id: "m1", status: "pending", summary: "fallback text", topics: [] }),
+        makeEmbedding(768, 1),
+      );
+
+      const [pending] = await getPendingRecords(dbPath);
+      await updateMemoryAfterRetry(dbPath, pending.id, pending.rowid, "Proper summary", ["dbt", "bigquery"], makeEmbedding(768, 99));
+
+      const stillPending = await getPendingRecords(dbPath);
+      assert.equal(stillPending.length, 0);
+    });
+
+    it("updates the vector embedding so the record is searchable", async () => {
+      await initDb(dbPath);
+      // Insert with a zero embedding (simulating a failed embed)
+      await insertMemory(
+        dbPath,
+        makeRecord({ id: "m1", status: "pending_embed", summary: "good summary", cwd: "/project" }),
+        new Float32Array(768), // zero vector
+      );
+
+      // Retry with a real embedding
+      const [pending] = await getPendingRecords(dbPath);
+      const realEmbedding = makeEmbedding(768, 42);
+      await updateMemoryAfterRetry(dbPath, pending.id, pending.rowid, "good summary", ["tag"], realEmbedding);
+
+      // Should now be findable via vector search
+      const results = await searchByVector(dbPath, realEmbedding, 5);
+      assert.equal(results.length, 1);
+      assert.equal(results[0].id, "m1");
+    });
+
+    it("updates summary and topics visible in subsequent queries", async () => {
+      await initDb(dbPath);
+      await insertMemory(
+        dbPath,
+        makeRecord({ id: "m1", status: "pending", summary: "bad fallback", topics: [], cwd: "/project" }),
+        makeEmbedding(768, 1),
+      );
+
+      const [pending] = await getPendingRecords(dbPath);
+      await updateMemoryAfterRetry(dbPath, pending.id, pending.rowid, "Refactored billing pipeline", ["dbt", "bigquery"], makeEmbedding(768, 1));
+
+      const recent = await getRecentForCwd(dbPath, "/project", null, 10);
+      assert.equal(recent[0].summary, "Refactored billing pipeline");
     });
   });
 });
