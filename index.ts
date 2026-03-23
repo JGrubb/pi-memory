@@ -16,7 +16,8 @@ import type { Config, MemoryRecord, ExtractedContent } from "./types.js";
 //   GOOGLE_CLOUD_PROJECT  — GCP project with Vertex AI enabled (required)
 //   PI_MEMORY_REGION      — Vertex AI region (default: "global")
 //   PI_MEMORY_EMBED_MODEL — embedding model (default: "gemini-embedding-001")
-//   PI_MEMORY_HAIKU_MODEL — summarization model (default: "claude-haiku-4-5@20251001")
+//   PI_MEMORY_SUMMARIZE_MODEL    — summarization model (default: "claude-haiku-4-5@20251001")
+//   PI_MEMORY_SUMMARIZE_PROVIDER — "vertex" (default) or "anthropic"
 //   PI_MEMORY_EMBED_DIMS  — embedding dimensions (default: 768)
 //   PI_MEMORY_DB_PATH     — database file path (default: ~/.pi/agent/memory/memory.db)
 // ---------------------------------------------------------------------------
@@ -25,7 +26,8 @@ const CONFIG: Config = {
   gcpProject: process.env.GOOGLE_CLOUD_PROJECT ?? "",
   region: process.env.PI_MEMORY_REGION || "global",
   embeddingModel: process.env.PI_MEMORY_EMBED_MODEL || "gemini-embedding-001",
-  haikuModel: process.env.PI_MEMORY_HAIKU_MODEL || "claude-haiku-4-5@20251001",
+  summarizeModel: process.env.PI_MEMORY_SUMMARIZE_MODEL || "claude-haiku-4-5@20251001",
+  summarizeProvider: (process.env.PI_MEMORY_SUMMARIZE_PROVIDER === "anthropic" ? "anthropic" : "vertex") as "vertex" | "anthropic",
   embeddingDims: Number(process.env.PI_MEMORY_EMBED_DIMS) || 768,
   dbPath:
     process.env.PI_MEMORY_DB_PATH ||

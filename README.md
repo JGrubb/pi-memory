@@ -42,15 +42,23 @@ Set the following environment variables (e.g. in your shell profile):
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `GOOGLE_CLOUD_PROJECT` | **Yes** | — | GCP project with Vertex AI API enabled (for embeddings) |
-| `ANTHROPIC_API_KEY` | **Yes** | — | Anthropic API key (for summarization via Claude Haiku) |
-| `PI_MEMORY_REGION` | No | `global` | Vertex AI region |
-| `PI_MEMORY_EMBED_MODEL` | No | `gemini-embedding-001` | Embedding model (Vertex AI) |
-| `PI_MEMORY_HAIKU_MODEL` | No | `claude-haiku-4-5@20251001` | Summarization model |
+| `GOOGLE_CLOUD_PROJECT` | **Yes** | — | GCP project with Vertex AI API enabled |
+| `PI_MEMORY_REGION` | No | `global` | Vertex AI region for embeddings. **Note:** if using a Claude summarization model via Vertex, set this to a region that supports Anthropic models (e.g. `us-east5`) — `global` will not work for Claude on Vertex. |
+| `PI_MEMORY_SUMMARIZE_MODEL` | No | `claude-haiku-4-5@20251001` | Summarization model name |
+| `PI_MEMORY_SUMMARIZE_PROVIDER` | No | `vertex` | Summarization provider: `vertex` (uses GCP ADC, no extra key needed) or `anthropic` (requires `ANTHROPIC_API_KEY`) |
+| `ANTHROPIC_API_KEY` | No | — | Only required when `PI_MEMORY_SUMMARIZE_PROVIDER=anthropic` |
+| `PI_MEMORY_EMBED_MODEL` | No | `gemini-embedding-001` | Embedding model (always Vertex AI) |
 | `PI_MEMORY_EMBED_DIMS` | No | `768` | Embedding dimensions |
 | `PI_MEMORY_DB_PATH` | No | `~/.pi/agent/memory/memory.db` | Database file path |
 
-> **Why two AI providers?** Embeddings use Vertex AI's Gemini embedding model (high quality, generous quota). Summarization uses the Anthropic API directly rather than routing Claude through Vertex AI — this avoids the much stricter Vertex AI quota limits on Anthropic-hosted models.
+**Recommended setup for GCP-only environments** (no Anthropic API key):
+
+```sh
+export GOOGLE_CLOUD_PROJECT=my-gcp-project
+export PI_MEMORY_SUMMARIZE_PROVIDER=vertex
+export PI_MEMORY_SUMMARIZE_MODEL=claude-haiku-4-5@20251001
+export PI_MEMORY_REGION=us-east5   # required for Claude on Vertex
+```
 
 ### GCP Setup (for embeddings)
 

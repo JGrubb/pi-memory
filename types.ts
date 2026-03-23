@@ -33,7 +33,8 @@ export interface Config {
   gcpProject: string;
   region: string;
   embeddingModel: string;
-  haikuModel: string;
+  summarizeModel: string;
+  summarizeProvider: "vertex" | "anthropic";
   embeddingDims: number;
   dbPath: string;
 }

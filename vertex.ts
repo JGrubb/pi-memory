@@ -36,16 +36,16 @@ function getAnthropicApiKey(): string {
 // ---------------------------------------------------------------------------
 
 function vertexUrl(config: Config, publisher: string, model: string, method: string): string {
-  const region = config.region;
+  const isGoogle = publisher === "google";
+  // Anthropic models on Vertex require a specific region (not "global").
+  // Fall back to us-east5 if region is left at the default "global".
+  const region =
+    !isGoogle && config.region === "global" ? "us-east5" : config.region;
   const host =
     region === "global"
       ? "aiplatform.googleapis.com"
       : `${region}-aiplatform.googleapis.com`;
-  const isGoogle = publisher === "google";
-  // For Google models (Gemini), the URL structure is different
-  if (isGoogle) {
-    return `https://${host}/v1/projects/${config.gcpProject}/locations/${region}/publishers/google/models/${model}:${method}`;
-  }
+  // For Google models (Gemini), the URL structure is the same but kept explicit
   return `https://${host}/v1/projects/${config.gcpProject}/locations/${region}/publishers/${publisher}/models/${model}:${method}`;
 }
 
@@ -129,22 +129,29 @@ export async function summarizeInteraction(
   conversationText: string,
   config: Config,
 ): Promise<{ summary: string; topics: string[] }> {
-  const isAnthropic = config.haikuModel.includes("claude");
   const prompt = EXTRACTION_PROMPT.replace("{{CONVERSATION}}", conversationText);
-
   let raw: string;
 
-  if (isAnthropic) {
-    // Claude/Haiku: use Anthropic API directly (no Vertex quota limits)
+  if (config.summarizeProvider === "anthropic") {
+    // Direct Anthropic API — requires ANTHROPIC_API_KEY
     const data = await anthropicFetch({
-      model: config.haikuModel,
+      model: config.summarizeModel,
+      max_tokens: 512,
+      messages: [{ role: "user", content: prompt }],
+    });
+    raw = data.content[0].text;
+  } else if (config.summarizeModel.startsWith("claude")) {
+    // Claude served through Vertex AI (Anthropic publisher)
+    const url = vertexUrl(config, "anthropic", config.summarizeModel, "rawPredict");
+    const data = await vertexFetch(url, {
+      anthropic_version: "vertex-2023-10-16",
       max_tokens: 512,
       messages: [{ role: "user", content: prompt }],
     });
     raw = data.content[0].text;
   } else {
-    // Gemini: use Vertex AI
-    const url = vertexUrl(config, "google", config.haikuModel, "streamGenerateContent");
+    // Gemini via Vertex AI
+    const url = vertexUrl(config, "google", config.summarizeModel, "streamGenerateContent");
     const data = await vertexFetch(url, {
       contents: [{ role: "user", parts: [{ text: prompt }] }],
       generationConfig: {
