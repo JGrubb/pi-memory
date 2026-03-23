@@ -38,9 +38,16 @@ export async function buildSessionContext(
       if (sessionCount >= 3) break; // At most 3 previous sessions
       const sessionDate = formatDate(memories[0].timestamp);
       parts.push(`\n**Session — ${sessionDate}**`);
+      // Collect all files touched across memories in this session
+      const sessionFiles = [
+        ...new Set(memories.flatMap((m) => m.filesTouched)),
+      ];
       for (const m of memories.slice(0, 5)) {
         const tags = m.topics.length > 0 ? ` [${m.topics.join(", ")}]` : "";
         parts.push(`- ${m.summary}${tags}`);
+      }
+      if (sessionFiles.length > 0) {
+        parts.push(`  *Files in scope: ${sessionFiles.slice(0, 10).join(", ")}*`);
       }
       sessionCount++;
     }
