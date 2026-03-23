@@ -43,6 +43,8 @@ function makeRecord(overrides: Partial<MemoryRecord> = {}): MemoryRecord {
     responseSnippet: "I've updated the billing model...",
     status: "complete",
     rawText: "User: Refactor the billing model\nAssistant: I've updated the billing model...",
+    type: "memory",
+    content: null,
     ...overrides,
   };
 }
@@ -358,6 +360,55 @@ describe("Database", () => {
 
       const results = await getRecentCrossProject(dbPath, "/only-project", 10);
       assert.equal(results.length, 0);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // artifact type behavior
+  // -------------------------------------------------------------------------
+
+  describe("artifacts", () => {
+    it("artifacts are excluded from getRecentForCwd", async () => {
+      await initDb(dbPath);
+      await insertMemory(dbPath, makeRecord({ id: "mem", type: "memory", cwd: "/project" }), makeEmbedding(768, 1));
+      await insertMemory(dbPath, makeRecord({ id: "art", type: "artifact", content: "SELECT 1", cwd: "/project" }), makeEmbedding(768, 2));
+
+      const results = await getRecentForCwd(dbPath, "/project", null, 10);
+      assert.equal(results.length, 1);
+      assert.equal(results[0].id, "mem");
+    });
+
+    it("artifacts are excluded from getRecentCrossProject", async () => {
+      await initDb(dbPath);
+      await insertMemory(dbPath, makeRecord({ id: "art", type: "artifact", content: "SELECT 1", cwd: "/other-project" }), makeEmbedding(768, 1));
+
+      const results = await getRecentCrossProject(dbPath, "/current-project", 10);
+      assert.equal(results.length, 0);
+    });
+
+    it("artifacts are included in searchByVector and return content", async () => {
+      await initDb(dbPath);
+      const embedding = makeEmbedding(768, 42);
+      await insertMemory(
+        dbPath,
+        makeRecord({ id: "art", type: "artifact", summary: "CPU query", content: "SELECT cpu FROM metrics", cwd: "/project" }),
+        embedding,
+      );
+
+      const results = await searchByVector(dbPath, embedding, 5);
+      assert.equal(results.length, 1);
+      assert.equal(results[0].type, "artifact");
+      assert.equal(results[0].content, "SELECT cpu FROM metrics");
+    });
+
+    it("memories returned from searchByVector have null content", async () => {
+      await initDb(dbPath);
+      const embedding = makeEmbedding(768, 1);
+      await insertMemory(dbPath, makeRecord({ id: "mem", type: "memory", cwd: "/project" }), embedding);
+
+      const results = await searchByVector(dbPath, embedding, 5);
+      assert.equal(results[0].type, "memory");
+      assert.equal(results[0].content, null);
     });
   });
 

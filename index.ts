@@ -42,6 +42,7 @@ let dbReady = false;
 let injectedThisSession = false;
 let cachedContext: string | null = null;
 let currentSessionId: string | null = null;
+let currentCwd: string | null = null;
 
 // Track in-flight stores so we can await them on shutdown
 const pendingStores: Set<Promise<void>> = new Set();
@@ -186,6 +187,8 @@ async function processAndStore(
     responseSnippet: extracted.assistantResponse.slice(0, 500),
     status,
     rawText: conversationText,
+    type: "memory",
+    content: null,
   };
 
   await insertMemory(CONFIG.dbPath, record, embedding);
@@ -236,6 +239,7 @@ export default function (pi: ExtensionAPI) {
     injectedThisSession = false;
     cachedContext = null;
     currentSessionId = ctx.sessionManager.getSessionId() ?? randomUUID();
+    currentCwd = ctx.cwd;
 
     if (!CONFIG.gcpProject) {
       console.error(
@@ -283,6 +287,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_switch", async (_event, ctx) => {
     injectedThisSession = false;
     currentSessionId = ctx.sessionManager.getSessionId() ?? randomUUID();
+    currentCwd = ctx.cwd;
 
     if (!dbReady) return;
 
@@ -401,6 +406,75 @@ export default function (pi: ExtensionAPI) {
       return {
         content: [{ type: "text", text: formatSearchResults(results) }],
         details: { count: results.length },
+      };
+    },
+  });
+
+  // -------------------------------------------------------------------------
+  // Tool: save_artifact
+  // -------------------------------------------------------------------------
+
+  pi.registerTool({
+    name: "save_artifact",
+    label: "Save Artifact",
+    description:
+      "Save a specific artifact (SQL query, research finding, command, config snippet, etc.) verbatim for precise future recall. Use this when the user asks to remember or save something specific.",
+    promptSnippet: "Save a specific artifact verbatim for future recall",
+    promptGuidelines: [
+      "Use save_artifact when the user says 'remember this', 'save this query', 'save this finding', or similar.",
+      "Write a clear, searchable title as the summary — e.g. 'CPU utilization query across dbserver fleet' not just 'query'.",
+      "Include the full verbatim content: SQL, results, commands, findings — whatever needs to be precisely recreated.",
+    ],
+    parameters: Type.Object({
+      summary: Type.String({
+        description: "Short descriptive title for the artifact — used for display and search",
+      }),
+      content: Type.String({
+        description: "The full verbatim content to save (SQL, results, commands, findings, etc.)",
+      }),
+      topics: Type.Optional(
+        Type.Array(Type.String(), {
+          description: "Short lowercase tags (e.g. 'bigquery', 'grafana', 'sql')",
+        }),
+      ),
+    }),
+
+    async execute(_toolCallId, params, _signal) {
+      if (!dbReady) {
+        throw new Error("Memory database not initialized");
+      }
+
+      // Embed title + content together for rich semantic search
+      const textToEmbed = `${params.summary}\n\n${params.content}`;
+      let embedding: Float32Array;
+      try {
+        embedding = await embedText(textToEmbed, CONFIG, "RETRIEVAL_DOCUMENT");
+      } catch (err) {
+        throw new Error(`Failed to embed artifact: ${err}`);
+      }
+
+      const record: MemoryRecord = {
+        id: randomUUID(),
+        sessionId: currentSessionId ?? "unknown",
+        timestamp: Date.now(),
+        cwd: currentCwd ?? "",
+        summary: params.summary,
+        topics: params.topics ?? [],
+        filesTouched: [],
+        toolsUsed: [],
+        userPrompt: "",
+        responseSnippet: "",
+        status: "complete",
+        rawText: "",
+        type: "artifact",
+        content: params.content,
+      };
+
+      await insertMemory(CONFIG.dbPath, record, embedding);
+
+      return {
+        content: [{ type: "text", text: `Artifact saved: "${params.summary}"` }],
+        details: { id: record.id },
       };
     },
   });

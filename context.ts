@@ -80,8 +80,14 @@ export function formatSearchResults(results: SearchResult[]): string {
     const project = shortenPath(r.cwd);
     const similarity = ((1 - r.distance) * 100).toFixed(0);
     const tags = r.topics.length > 0 ? ` [${r.topics.join(", ")}]` : "";
-    lines.push(`**${project}** (${date}, ${similarity}% match)${tags}`);
+    const label = r.type === "artifact" ? "📎 " : "";
+    lines.push(`**${label}${project}** (${date}, ${similarity}% match)${tags}`);
     lines.push(`  ${r.summary}`);
+    if (r.type === "artifact" && r.content) {
+      lines.push("  ```");
+      lines.push(r.content.split("\n").map((l) => `  ${l}`).join("\n"));
+      lines.push("  ```");
+    }
     if (r.filesTouched.length > 0) {
       lines.push(`  Files: ${r.filesTouched.slice(0, 5).join(", ")}`);
     }

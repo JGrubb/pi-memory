@@ -1,4 +1,5 @@
 export type MemoryStatus = "complete" | "pending" | "pending_embed";
+export type MemoryType = "memory" | "artifact";
 
 export interface MemoryRecord {
   id: string;
@@ -13,6 +14,8 @@ export interface MemoryRecord {
   responseSnippet: string;
   status: MemoryStatus;
   rawText: string;
+  type: MemoryType;
+  content: string | null; // verbatim content for artifacts, null for memories
 }
 
 export interface SearchResult {
@@ -24,6 +27,8 @@ export interface SearchResult {
   filesTouched: string[];
   userPrompt: string;
   distance: number;
+  type: MemoryType;
+  content: string | null;
 }
 
 export interface ExtractedContent {

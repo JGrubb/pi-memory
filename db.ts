@@ -2,7 +2,7 @@ import Database from "better-sqlite3";
 import * as sqliteVec from "sqlite-vec";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import type { MemoryRecord, MemoryStatus, SearchResult } from "./types.js";
+import type { MemoryRecord, MemoryStatus, MemoryType, SearchResult } from "./types.js";
 
 // ---------------------------------------------------------------------------
 // Schema
@@ -22,7 +22,9 @@ CREATE TABLE IF NOT EXISTS memories (
     user_prompt     TEXT,
     response_snippet TEXT,
     status          TEXT NOT NULL DEFAULT 'complete',
-    raw_text        TEXT
+    raw_text        TEXT,
+    type            TEXT NOT NULL DEFAULT 'memory',
+    content         TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_memories_cwd ON memories(cwd);
@@ -36,6 +38,8 @@ const MIGRATIONS = [
   `ALTER TABLE memories ADD COLUMN status TEXT NOT NULL DEFAULT 'complete'`,
   `ALTER TABLE memories ADD COLUMN raw_text TEXT`,
   `CREATE INDEX IF NOT EXISTS idx_memories_status ON memories(status)`,
+  `ALTER TABLE memories ADD COLUMN type TEXT NOT NULL DEFAULT 'memory'`,
+  `ALTER TABLE memories ADD COLUMN content TEXT`,
 ];
 
 // vec0 virtual table — cosine distance, with cwd as a metadata column for
@@ -141,8 +145,8 @@ export async function insertMemory(
     // Upsert into memories table
     db.prepare(
       `INSERT INTO memories
-       (id, session_id, timestamp, cwd, summary, topics, files_touched, tools_used, user_prompt, response_snippet, status, raw_text)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       (id, session_id, timestamp, cwd, summary, topics, files_touched, tools_used, user_prompt, response_snippet, status, raw_text, type, content)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(id) DO UPDATE SET
          summary = excluded.summary,
          topics = excluded.topics,
@@ -151,7 +155,9 @@ export async function insertMemory(
          user_prompt = excluded.user_prompt,
          response_snippet = excluded.response_snippet,
          status = excluded.status,
-         raw_text = excluded.raw_text`,
+         raw_text = excluded.raw_text,
+         type = excluded.type,
+         content = excluded.content`,
     ).run(
       record.id,
       record.sessionId,
@@ -165,6 +171,8 @@ export async function insertMemory(
       record.responseSnippet,
       record.status,
       record.rawText,
+      record.type,
+      record.content,
     );
 
     // Get the rowid (works for both insert and update)
@@ -242,7 +250,7 @@ export async function searchByVector(
   const placeholders = knnRows.map(() => "?").join(",");
   const memRows = db
     .prepare(
-      `SELECT rowid, id, summary, cwd, timestamp, topics, files_touched, user_prompt
+      `SELECT rowid, id, summary, cwd, timestamp, topics, files_touched, user_prompt, type, content
        FROM memories
        WHERE rowid IN (${placeholders})`,
     )
@@ -266,6 +274,8 @@ export async function searchByVector(
         filesTouched: safeJsonParse(m.files_touched, []),
         userPrompt: m.user_prompt ?? "",
         distance: kr.distance,
+        type: (m.type ?? "memory") as MemoryType,
+        content: m.content ?? null,
       };
     });
 }
@@ -286,18 +296,18 @@ export async function getRecentForCwd(
 
   if (excludeSessionId) {
     sql = `
-      SELECT id, summary, cwd, timestamp, topics, files_touched, user_prompt
+      SELECT id, summary, cwd, timestamp, topics, files_touched, user_prompt, type, content
       FROM memories
-      WHERE cwd = ? AND (session_id IS NULL OR session_id != ?)
+      WHERE cwd = ? AND (session_id IS NULL OR session_id != ?) AND type = 'memory'
       ORDER BY timestamp DESC
       LIMIT ?
     `;
     args.push(excludeSessionId, limit);
   } else {
     sql = `
-      SELECT id, summary, cwd, timestamp, topics, files_touched, user_prompt
+      SELECT id, summary, cwd, timestamp, topics, files_touched, user_prompt, type, content
       FROM memories
-      WHERE cwd = ?
+      WHERE cwd = ? AND type = 'memory'
       ORDER BY timestamp DESC
       LIMIT ?
     `;
@@ -315,6 +325,8 @@ export async function getRecentForCwd(
     filesTouched: safeJsonParse(r.files_touched, []),
     userPrompt: r.user_prompt ?? "",
     distance: 0,
+    type: "memory" as MemoryType,
+    content: null,
   }));
 }
 
@@ -332,7 +344,7 @@ export async function getRecentCrossProject(
       INNER JOIN (
         SELECT cwd, MAX(timestamp) as max_ts
         FROM memories
-        WHERE cwd != ?
+        WHERE cwd != ? AND type = 'memory'
         GROUP BY cwd
       ) latest ON m.cwd = latest.cwd AND m.timestamp = latest.max_ts
       ORDER BY m.timestamp DESC
@@ -350,6 +362,8 @@ export async function getRecentCrossProject(
     filesTouched: safeJsonParse(r.files_touched, []),
     userPrompt: r.user_prompt ?? "",
     distance: 0,
+    type: "memory" as MemoryType,
+    content: null,
   }));
 }
 

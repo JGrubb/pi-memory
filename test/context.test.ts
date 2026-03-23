@@ -34,6 +34,8 @@ function makeRecord(overrides: Partial<MemoryRecord> = {}): MemoryRecord {
     responseSnippet: "Done.",
     status: "complete",
     rawText: "User: Refactor billing\nAssistant: Done.",
+    type: "memory",
+    content: null,
     ...overrides,
   };
 }
