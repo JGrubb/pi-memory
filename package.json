@@ -7,11 +7,15 @@
       "./index.ts"
     ]
   },
+  "scripts": {
+    "test": "node --import tsx/esm --test test/*.test.ts"
+  },
   "dependencies": {
     "better-sqlite3": "^12.8.0",
     "sqlite-vec": "^0.1.7"
   },
   "devDependencies": {
-    "@types/better-sqlite3": "^7.6.13"
+    "@types/better-sqlite3": "^7.6.13",
+    "tsx": "^4.21.0"
   }
 }
