@@ -5,8 +5,8 @@ import { randomUUID } from "node:crypto";
 import * as os from "node:os";
 import * as path from "node:path";
 
-import { initDb, insertMemory, searchByVector, getStats, getPendingRecords, updateMemoryAfterRetry } from "./db.js";
-import { embedText, summarizeInteraction } from "./vertex.js";
+import { initDb, insertMemory, searchByVector, getStats, getPendingRecords, updateMemoryAfterRetry, upsertSession, updateSessionName, findSimilarSessions, backfillSessionsFromJSONL } from "./db.js";
+import { embedText, summarizeInteraction, nameSession } from "./vertex.js";
 import { buildSessionContext, formatSearchResults } from "./context.js";
 import type { Config, MemoryRecord, ExtractedContent } from "./types.js";
 
@@ -46,6 +46,11 @@ let currentCwd: string | null = null;
 
 // Track in-flight stores so we can await them on shutdown
 const pendingStores: Set<Promise<void>> = new Set();
+
+// Session naming state — reset on each session start/switch
+let agentEndCount = 0;
+let conversationBuffer: any[] = [];
+let namingComplete = false;
 
 // ---------------------------------------------------------------------------
 // Message parsing
@@ -227,6 +232,46 @@ async function retryPendingRecords(): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// Session naming
+// ---------------------------------------------------------------------------
+
+async function performSessionNaming(
+  messages: any[],
+  cwd: string,
+  sessionId: string,
+): Promise<void> {
+  const conversationText = buildConversationText(messages);
+  if (conversationText.trim().length < 50) return;
+
+  // Step 1: Get main_topic and sub_topic from the LLM
+  const { mainTopic, subTopic } = await nameSession(conversationText, CONFIG);
+  if (!mainTopic) return;
+
+  // Step 2: Embed the main_topic for continuation detection
+  const embedding = await embedText(mainTopic, CONFIG, "RETRIEVAL_DOCUMENT");
+
+  // Step 3: Check for similar sessions in the same cwd
+  const similar = await findSimilarSessions(CONFIG.dbPath, cwd, sessionId, embedding, 0.85);
+
+  // Count how many prior sessions share this main_topic
+  const sameTopicCount = similar.filter(
+    (s) => s.mainTopic?.toLowerCase() === mainTopic.toLowerCase(),
+  ).length;
+
+  // Step 4: Build the final name
+  let name: string;
+  if (sameTopicCount > 0) {
+    name = `${mainTopic} - ${subTopic} (cont. ${sameTopicCount + 1})`;
+  } else {
+    name = subTopic ? `${mainTopic} - ${subTopic}` : mainTopic;
+  }
+
+  // Step 5: Persist to sessions table and set the pi session name
+  await updateSessionName(CONFIG.dbPath, sessionId, mainTopic, subTopic, name, embedding);
+  pi.setSessionName(name);
+}
+
+// ---------------------------------------------------------------------------
 // Extension
 // ---------------------------------------------------------------------------
 
@@ -240,6 +285,9 @@ export default function (pi: ExtensionAPI) {
     cachedContext = null;
     currentSessionId = ctx.sessionManager.getSessionId() ?? randomUUID();
     currentCwd = ctx.cwd;
+    agentEndCount = 0;
+    conversationBuffer = [];
+    namingComplete = !!pi.getSessionName(); // skip if already named from a prior run
 
     if (!CONFIG.gcpProject) {
       console.error(
@@ -260,6 +308,18 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
+    // Register this session in the sessions table (no-op if already present)
+    await upsertSession(CONFIG.dbPath, {
+      id: currentSessionId,
+      cwd: ctx.cwd,
+      sessionFile: ctx.sessionManager.getSessionFile() ?? null,
+      name: null,
+      mainTopic: null,
+      subTopic: null,
+      timestamp: Date.now(),
+      namedAt: null,
+    }).catch((err) => console.error("[memory] Session upsert failed:", err));
+
     try {
       cachedContext = await buildSessionContext(CONFIG.dbPath, ctx.cwd, currentSessionId);
       if (cachedContext) {
@@ -273,8 +333,13 @@ export default function (pi: ExtensionAPI) {
       console.error("[memory] Context build failed:", err);
     }
 
-    // Kick off backfill for any pending records — fire and forget so startup
-    // isn't blocked. Records that fail again remain pending for the next start.
+    // One-time backfill of existing named sessions from JSONL files
+    const piSessionsDir = path.join(os.homedir(), ".pi", "agent", "sessions");
+    backfillSessionsFromJSONL(CONFIG.dbPath, piSessionsDir).catch((err) =>
+      console.error("[memory] Session backfill failed:", err),
+    );
+
+    // Retry any failed memory records from previous sessions
     retryPendingRecords().catch((err) =>
       console.error("[memory] Backfill failed:", err),
     );
@@ -288,8 +353,23 @@ export default function (pi: ExtensionAPI) {
     injectedThisSession = false;
     currentSessionId = ctx.sessionManager.getSessionId() ?? randomUUID();
     currentCwd = ctx.cwd;
+    agentEndCount = 0;
+    conversationBuffer = [];
+    namingComplete = !!pi.getSessionName();
 
     if (!dbReady) return;
+
+    // Register the new session (no-op if already present, preserves existing name)
+    await upsertSession(CONFIG.dbPath, {
+      id: currentSessionId,
+      cwd: ctx.cwd,
+      sessionFile: ctx.sessionManager.getSessionFile() ?? null,
+      name: null,
+      mainTopic: null,
+      subTopic: null,
+      timestamp: Date.now(),
+      namedAt: null,
+    }).catch((err) => console.error("[memory] Session upsert failed:", err));
 
     try {
       cachedContext = await buildSessionContext(CONFIG.dbPath, ctx.cwd, currentSessionId);
@@ -341,12 +421,30 @@ export default function (pi: ExtensionAPI) {
     const cwd = ctx.cwd;
     const sessionId = currentSessionId ?? "unknown";
 
+    // Accumulate messages for session naming
+    conversationBuffer.push(...messages);
+    agentEndCount++;
+
+    // Store memory for this turn (fire and forget)
     const promise = processAndStore(messages, cwd, sessionId).catch((err) =>
       console.error("[memory] Background store failed:", err),
     );
-
     pendingStores.add(promise);
     promise.finally(() => pendingStores.delete(promise));
+
+    // Trigger session naming at turn 5 — enough context to be meaningful,
+    // enough friction to filter out throwaway sessions
+    if (agentEndCount === 5 && !namingComplete) {
+      namingComplete = true; // prevent double-firing
+      const snapshot = [...conversationBuffer];
+      const sessionIdSnapshot = sessionId;
+
+      const namingPromise = performSessionNaming(snapshot, cwd, sessionIdSnapshot).catch((err) =>
+        console.error("[memory] Session naming failed:", err),
+      );
+      pendingStores.add(namingPromise);
+      namingPromise.finally(() => pendingStores.delete(namingPromise));
+    }
   });
 
   // -------------------------------------------------------------------------

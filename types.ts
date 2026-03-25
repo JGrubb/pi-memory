@@ -20,6 +20,7 @@ export interface MemoryRecord {
 
 export interface SearchResult {
   id: string;
+  sessionId: string | null;
   summary: string;
   cwd: string;
   timestamp: number;
@@ -29,6 +30,17 @@ export interface SearchResult {
   distance: number;
   type: MemoryType;
   content: string | null;
+}
+
+export interface SessionRecord {
+  id: string;
+  cwd: string;
+  sessionFile: string | null;
+  name: string | null;
+  mainTopic: string | null;
+  subTopic: string | null;
+  timestamp: number;
+  namedAt: number | null;
 }
 
 export interface ExtractedContent {

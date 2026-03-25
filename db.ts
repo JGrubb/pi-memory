@@ -2,7 +2,7 @@ import Database from "better-sqlite3";
 import * as sqliteVec from "sqlite-vec";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import type { MemoryRecord, MemoryStatus, MemoryType, SearchResult } from "./types.js";
+import type { MemoryRecord, MemoryStatus, MemoryType, SearchResult, SessionRecord } from "./types.js";
 
 // ---------------------------------------------------------------------------
 // Schema
@@ -40,6 +40,27 @@ const MIGRATIONS = [
   `CREATE INDEX IF NOT EXISTS idx_memories_status ON memories(status)`,
   `ALTER TABLE memories ADD COLUMN type TEXT NOT NULL DEFAULT 'memory'`,
   `ALTER TABLE memories ADD COLUMN content TEXT`,
+];
+
+const SESSIONS_TABLE = `
+CREATE TABLE IF NOT EXISTS sessions (
+    id           TEXT PRIMARY KEY,
+    cwd          TEXT NOT NULL,
+    session_file TEXT,
+    name         TEXT,
+    main_topic   TEXT,
+    sub_topic    TEXT,
+    embedding    BLOB,
+    timestamp    INTEGER NOT NULL,
+    named_at     INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS idx_sessions_cwd ON sessions(cwd);
+CREATE INDEX IF NOT EXISTS idx_sessions_ts ON sessions(timestamp DESC);
+`;
+
+const SESSIONS_MIGRATIONS = [
+  // future migrations go here
 ];
 
 // vec0 virtual table — cosine distance, with cwd as a metadata column for
@@ -118,9 +139,10 @@ export async function initDb(dbPath: string): Promise<void> {
   const db = getDb(dbPath);
   db.exec(MEMORIES_TABLE);
   db.exec(VEC_TABLE);
+  db.exec(SESSIONS_TABLE);
 
   // Run migrations — each is safe to ignore if the column already exists
-  for (const sql of MIGRATIONS) {
+  for (const sql of [...MIGRATIONS, ...SESSIONS_MIGRATIONS]) {
     try {
       db.exec(sql);
     } catch (e: any) {
@@ -296,7 +318,7 @@ export async function getRecentForCwd(
 
   if (excludeSessionId) {
     sql = `
-      SELECT id, summary, cwd, timestamp, topics, files_touched, user_prompt, type, content
+      SELECT id, session_id, summary, cwd, timestamp, topics, files_touched, user_prompt, type, content
       FROM memories
       WHERE cwd = ? AND (session_id IS NULL OR session_id != ?) AND type = 'memory'
       ORDER BY timestamp DESC
@@ -305,7 +327,7 @@ export async function getRecentForCwd(
     args.push(excludeSessionId, limit);
   } else {
     sql = `
-      SELECT id, summary, cwd, timestamp, topics, files_touched, user_prompt, type, content
+      SELECT id, session_id, summary, cwd, timestamp, topics, files_touched, user_prompt, type, content
       FROM memories
       WHERE cwd = ? AND type = 'memory'
       ORDER BY timestamp DESC
@@ -318,6 +340,7 @@ export async function getRecentForCwd(
 
   return rows.map((r: any) => ({
     id: r.id,
+    sessionId: r.session_id ?? null,
     summary: r.summary,
     cwd: r.cwd,
     timestamp: r.timestamp,
@@ -428,6 +451,268 @@ export async function updateMemoryAfterRetry(
     }
   });
   trx();
+}
+
+// ---------------------------------------------------------------------------
+// Sessions table
+// ---------------------------------------------------------------------------
+
+/** Convert a Buffer (stored BLOB) back to Float32Array. */
+function bufToVec(buf: Buffer): Float32Array {
+  return new Float32Array(buf.buffer, buf.byteOffset, buf.byteLength / 4);
+}
+
+/** Dot product of two unit-normalized vectors = cosine similarity. */
+function cosineSimilarity(a: Float32Array, b: Float32Array): number {
+  let dot = 0;
+  for (let i = 0; i < a.length; i++) dot += a[i] * b[i];
+  return dot;
+}
+
+/**
+ * Upsert a session record. Uses INSERT OR IGNORE so existing rows (including
+ * their names and embeddings) are never overwritten by a bare upsert.
+ */
+export async function upsertSession(
+  dbPath: string,
+  record: SessionRecord,
+): Promise<void> {
+  const db = getDb(dbPath);
+  db.prepare(
+    `INSERT OR IGNORE INTO sessions (id, cwd, session_file, name, main_topic, sub_topic, embedding, timestamp, named_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    record.id,
+    record.cwd,
+    record.sessionFile,
+    record.name,
+    record.mainTopic,
+    record.subTopic,
+    null,
+    record.timestamp,
+    record.namedAt,
+  );
+}
+
+/**
+ * Set the name, topics, and embedding on a session after the naming LLM call.
+ */
+export async function updateSessionName(
+  dbPath: string,
+  id: string,
+  mainTopic: string,
+  subTopic: string,
+  name: string,
+  embedding: Float32Array,
+): Promise<void> {
+  const db = getDb(dbPath);
+  db.prepare(
+    `UPDATE sessions
+     SET name = ?, main_topic = ?, sub_topic = ?, embedding = ?, named_at = ?
+     WHERE id = ?`,
+  ).run(name, mainTopic, subTopic, vecBuf(embedding), Date.now(), id);
+}
+
+/**
+ * Return recent named sessions for a given cwd, excluding the current session.
+ */
+export async function getRecentSessions(
+  dbPath: string,
+  cwd: string,
+  excludeId: string,
+  limit: number = 10,
+): Promise<SessionRecord[]> {
+  const db = getDb(dbPath);
+  const rows = db
+    .prepare(
+      `SELECT id, cwd, session_file, name, main_topic, sub_topic, timestamp, named_at
+       FROM sessions
+       WHERE cwd = ? AND id != ? AND name IS NOT NULL
+       ORDER BY timestamp DESC
+       LIMIT ?`,
+    )
+    .all(cwd, excludeId, limit) as any[];
+
+  return rows.map((r) => ({
+    id: r.id,
+    cwd: r.cwd,
+    sessionFile: r.session_file ?? null,
+    name: r.name,
+    mainTopic: r.main_topic ?? null,
+    subTopic: r.sub_topic ?? null,
+    timestamp: r.timestamp,
+    namedAt: r.named_at ?? null,
+  }));
+}
+
+/**
+ * Return the most recent named session per project cwd, excluding the current cwd.
+ * Used for cross-project chapter headings in the startup context.
+ */
+export async function getRecentSessionsCrossProject(
+  dbPath: string,
+  excludeCwd: string,
+  limit: number = 8,
+): Promise<SessionRecord[]> {
+  const db = getDb(dbPath);
+  const rows = db
+    .prepare(
+      `SELECT s.id, s.cwd, s.session_file, s.name, s.main_topic, s.sub_topic, s.timestamp, s.named_at
+       FROM sessions s
+       INNER JOIN (
+         SELECT cwd, MAX(timestamp) as max_ts
+         FROM sessions
+         WHERE cwd != ? AND name IS NOT NULL
+         GROUP BY cwd
+       ) latest ON s.cwd = latest.cwd AND s.timestamp = latest.max_ts AND s.name IS NOT NULL
+       ORDER BY s.timestamp DESC
+       LIMIT ?`,
+    )
+    .all(excludeCwd, limit) as any[];
+
+  return rows.map((r) => ({
+    id: r.id,
+    cwd: r.cwd,
+    sessionFile: r.session_file ?? null,
+    name: r.name,
+    mainTopic: r.main_topic ?? null,
+    subTopic: r.sub_topic ?? null,
+    timestamp: r.timestamp,
+    namedAt: r.named_at ?? null,
+  }));
+}
+
+/**
+ * Find sessions in the same cwd whose main_topic embedding is similar to the
+ * given embedding. Results are ordered by similarity descending and filtered
+ * to those above the threshold. Sessions without embeddings are skipped.
+ */
+export async function findSimilarSessions(
+  dbPath: string,
+  cwd: string,
+  excludeId: string,
+  queryEmbedding: Float32Array,
+  threshold: number = 0.85,
+): Promise<SessionRecord[]> {
+  const db = getDb(dbPath);
+  const rows = db
+    .prepare(
+      `SELECT id, cwd, session_file, name, main_topic, sub_topic, timestamp, named_at, embedding
+       FROM sessions
+       WHERE cwd = ? AND id != ? AND name IS NOT NULL AND embedding IS NOT NULL`,
+    )
+    .all(cwd, excludeId) as any[];
+
+  const scored = rows
+    .map((r) => {
+      const vec = bufToVec(r.embedding as Buffer);
+      const similarity = cosineSimilarity(queryEmbedding, vec);
+      return { record: r, similarity };
+    })
+    .filter(({ similarity }) => similarity >= threshold)
+    .sort((a, b) => b.similarity - a.similarity);
+
+  return scored.map(({ record: r }) => ({
+    id: r.id,
+    cwd: r.cwd,
+    sessionFile: r.session_file ?? null,
+    name: r.name,
+    mainTopic: r.main_topic ?? null,
+    subTopic: r.sub_topic ?? null,
+    timestamp: r.timestamp,
+    namedAt: r.named_at ?? null,
+  }));
+}
+
+/**
+ * One-time backfill: scan JSONL session files and import any that have a
+ * session_info name entry but aren't already in the sessions table.
+ * Skips embedding generation — backfilled sessions appear as chapter headings
+ * but don't participate in similarity-based continuation detection.
+ */
+export async function backfillSessionsFromJSONL(
+  dbPath: string,
+  sessionsDir: string,
+): Promise<void> {
+  if (!fs.existsSync(sessionsDir)) return;
+
+  const db = getDb(dbPath);
+  const projectDirs = fs.readdirSync(sessionsDir).filter((d) => {
+    return fs.statSync(path.join(sessionsDir, d)).isDirectory();
+  });
+
+  // Collect all parseable sessions across all project directories first,
+  // then sort chronologically before inserting — so the sessions table
+  // reflects the actual order work happened in.
+  interface ParsedSession {
+    filePath: string;
+    sessionId: string;
+    sessionCwd: string;
+    sessionTimestamp: number;
+    name: string;
+  }
+
+  const parsed: ParsedSession[] = [];
+
+  for (const projectDir of projectDirs) {
+    const projectPath = path.join(sessionsDir, projectDir);
+    const files = fs.readdirSync(projectPath).filter((f) => f.endsWith(".jsonl"));
+
+    for (const file of files) {
+      const filePath = path.join(projectPath, file);
+
+      let sessionId: string | null = null;
+      let sessionCwd: string | null = null;
+      let sessionTimestamp: number = Date.now();
+      let lastName: string | null = null;
+
+      try {
+        const content = fs.readFileSync(filePath, "utf8");
+        const lines = content.trim().split("\n");
+
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          let entry: any;
+          try { entry = JSON.parse(line); } catch { continue; }
+
+          if (entry.type === "session") {
+            sessionId = entry.id ?? null;
+            sessionCwd = entry.cwd ?? null;
+            sessionTimestamp = entry.timestamp ? new Date(entry.timestamp).getTime() : Date.now();
+          } else if (entry.type === "session_info" && entry.name) {
+            lastName = entry.name;
+          }
+        }
+      } catch {
+        continue; // skip unreadable files
+      }
+
+      if (!sessionId || !sessionCwd || !lastName) continue;
+      parsed.push({ filePath, sessionId, sessionCwd, sessionTimestamp, name: lastName });
+    }
+  }
+
+  // Sort oldest → newest so insertion order reflects chronological history
+  parsed.sort((a, b) => a.sessionTimestamp - b.sessionTimestamp);
+
+  for (const { filePath, sessionId, sessionCwd, sessionTimestamp, name } of parsed) {
+    const dashIdx = name.indexOf(" - ");
+    const mainTopic = dashIdx !== -1 ? name.slice(0, dashIdx) : name;
+    const subTopic = dashIdx !== -1 ? name.slice(dashIdx + 3) : null;
+
+    // Ensure the row exists (no-op if already present with a name)
+    db.prepare(
+      `INSERT OR IGNORE INTO sessions (id, cwd, session_file, name, main_topic, sub_topic, embedding, timestamp, named_at)
+       VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?)`,
+    ).run(sessionId, sessionCwd, filePath, name, mainTopic, subTopic, sessionTimestamp, sessionTimestamp);
+
+    // If the row existed but had no name yet (registered but not yet named),
+    // fill in the name from the JSONL — backfill without an embedding.
+    db.prepare(
+      `UPDATE sessions SET name = ?, main_topic = ?, sub_topic = ?, named_at = ?
+       WHERE id = ? AND name IS NULL`,
+    ).run(name, mainTopic, subTopic, sessionTimestamp, sessionId);
+  }
 }
 
 // ---------------------------------------------------------------------------

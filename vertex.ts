@@ -111,6 +111,65 @@ export async function embedText(
 // Summarization — Claude Haiku 4.5 on Vertex AI
 // ---------------------------------------------------------------------------
 
+const NAMING_PROMPT = `Given this coding session conversation, extract a two-part name.
+
+Return a JSON object with exactly these fields:
+- "main_topic": 2-4 words identifying the domain or system being worked on (e.g. "GCP Billing", "Memory Extension", "Pub/Sub Pipeline", "Metabase")
+- "sub_topic": 3-6 words describing the specific mission in this session (e.g. "Pub/Sub backlog investigation", "artifact storage implementation", "Cloud Run blue-green upgrade")
+
+Be specific and concrete. Prefer technical terms over vague descriptions.
+
+<conversation>
+{{CONVERSATION}}
+</conversation>
+
+Respond with ONLY the JSON object. No markdown fencing, no explanation.`;
+
+export async function nameSession(
+  conversationText: string,
+  config: Config,
+): Promise<{ mainTopic: string; subTopic: string }> {
+  const prompt = NAMING_PROMPT.replace("{{CONVERSATION}}", conversationText);
+  let raw: string;
+
+  if (config.summarizeProvider === "anthropic") {
+    const data = await anthropicFetch({
+      model: config.summarizeModel,
+      max_tokens: 128,
+      messages: [{ role: "user", content: prompt }],
+    });
+    raw = data.content[0].text;
+  } else if (config.summarizeModel.startsWith("claude")) {
+    const url = vertexUrl(config, "anthropic", config.summarizeModel, "rawPredict");
+    const data = await vertexFetch(url, {
+      anthropic_version: "vertex-2023-10-16",
+      max_tokens: 128,
+      messages: [{ role: "user", content: prompt }],
+    });
+    raw = data.content[0].text;
+  } else {
+    const url = vertexUrl(config, "google", config.summarizeModel, "streamGenerateContent");
+    const data = await vertexFetch(url, {
+      contents: [{ role: "user", parts: [{ text: prompt }] }],
+      generationConfig: { maxOutputTokens: 128, temperature: 0.1 },
+    });
+    raw = data[0].candidates[0].content.parts[0].text;
+  }
+
+  const text = raw.replace(/^```(?:json)?\s*\n?/i, "").replace(/\n?```\s*$/i, "").trim();
+
+  try {
+    const parsed = JSON.parse(text);
+    return {
+      mainTopic: (parsed.main_topic ?? "").trim(),
+      subTopic: (parsed.sub_topic ?? "").trim(),
+    };
+  } catch {
+    // If parsing fails, use the whole text as sub_topic with a generic main_topic
+    return { mainTopic: "Session", subTopic: text.slice(0, 60) };
+  }
+}
+
 const EXTRACTION_PROMPT = `Extract a concise memory from this coding session interaction.
 
 Return a JSON object with exactly these fields:
