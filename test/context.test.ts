@@ -4,7 +4,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
 
-import { initDb, insertMemory, upsertSession, updateSessionName } from "../db.js";
+import { initDb, insertMemory, upsertSession, updateSessionName, updateSessionDescription } from "../db.js";
 import { buildSessionContext, formatSearchResults } from "../context.js";
 import type { MemoryRecord, SearchResult, SessionRecord } from "../types.js";
 
@@ -61,80 +61,56 @@ describe("buildSessionContext", () => {
     }
   });
 
-  it("returns null when there are no memories", async () => {
+  it("returns null when there are no sessions", async () => {
     await initDb(dbPath);
     const ctx = await buildSessionContext(dbPath, "/some/project", null);
     assert.equal(ctx, null);
   });
 
-  it("includes same-cwd memories from previous sessions", async () => {
+  it("shows named session with description and files", async () => {
     await initDb(dbPath);
 
-    await insertMemory(
-      dbPath,
-      makeRecord({
-        id: "prev",
-        sessionId: "old-session",
-        cwd: "/my/project",
-        summary: "Fixed the auth middleware",
-        topics: ["auth", "middleware"],
-      }),
-      makeEmbedding(),
-    );
+    await upsertSession(dbPath, makeSessionRecord({ id: "s1", cwd: "/my/project" }));
+    await updateSessionName(dbPath, "s1", "Auth", "middleware fix", "Auth - middleware fix", makeSessionEmbedding());
+    await updateSessionDescription(dbPath, "s1", "Fixed the auth middleware to handle token expiry correctly.", ["/my/project/src/auth.ts"]);
 
     const ctx = await buildSessionContext(dbPath, "/my/project", "current-session");
     assert.ok(ctx !== null);
     assert.ok(ctx!.includes("Recent work in this directory"), "Should have same-cwd section");
-    assert.ok(ctx!.includes("Fixed the auth middleware"), "Should include the summary");
-    assert.ok(ctx!.includes("auth"), "Should include topics");
+    assert.ok(ctx!.includes("Auth - middleware fix"), "Should show session name");
+    assert.ok(ctx!.includes("Fixed the auth middleware"), "Should show description");
+    assert.ok(ctx!.includes("auth.ts"), "Should show files");
   });
 
-  it("excludes memories from the current session", async () => {
+  it("shows session name without description when description not yet generated", async () => {
     await initDb(dbPath);
 
-    await insertMemory(
-      dbPath,
-      makeRecord({
-        id: "current",
-        sessionId: "this-session",
-        cwd: "/my/project",
-        summary: "Current session work",
-      }),
-      makeEmbedding(),
-    );
-    await insertMemory(
-      dbPath,
-      makeRecord({
-        id: "previous",
-        sessionId: "old-session",
-        cwd: "/my/project",
-        summary: "Previous session work",
-      }),
-      makeEmbedding(),
-    );
+    await upsertSession(dbPath, makeSessionRecord({ id: "s1", cwd: "/my/project" }));
+    await updateSessionName(dbPath, "s1", "Auth", "middleware fix", "Auth - middleware fix", makeSessionEmbedding());
 
-    const ctx = await buildSessionContext(dbPath, "/my/project", "this-session");
+    const ctx = await buildSessionContext(dbPath, "/my/project", "current-session");
     assert.ok(ctx !== null);
-    assert.ok(!ctx!.includes("Current session work"), "Should NOT include current session");
-    assert.ok(ctx!.includes("Previous session work"), "Should include previous session");
+    assert.ok(ctx!.includes("Auth - middleware fix"), "Should show session name even without description");
   });
 
-  it("includes cross-project memories", async () => {
+  it("excludes current session", async () => {
     await initDb(dbPath);
 
-    // Cross-project section now comes from named sessions, not raw memories.
-    // Create both a memory and a named session for the other project.
-    await insertMemory(
-      dbPath,
-      makeRecord({
-        id: "other-project",
-        sessionId: "s1",
-        cwd: "/other/repo",
-        summary: "Deployed new terraform module",
-        topics: ["terraform"],
-      }),
-      makeEmbedding(),
-    );
+    await upsertSession(dbPath, makeSessionRecord({ id: "current", cwd: "/my/project" }));
+    await updateSessionName(dbPath, "current", "Topic", "current work", "Topic - current work", makeSessionEmbedding());
+
+    await upsertSession(dbPath, makeSessionRecord({ id: "previous", cwd: "/my/project" }));
+    await updateSessionName(dbPath, "previous", "Topic", "previous work", "Topic - previous work", makeSessionEmbedding());
+
+    const ctx = await buildSessionContext(dbPath, "/my/project", "current");
+    assert.ok(ctx !== null);
+    assert.ok(!ctx!.includes("current work"), "Should NOT include current session");
+    assert.ok(ctx!.includes("previous work"), "Should include previous session");
+  });
+
+  it("includes cross-project named sessions", async () => {
+    await initDb(dbPath);
+
     await upsertSession(dbPath, makeSessionRecord({ id: "s1", cwd: "/other/repo" }));
     await updateSessionName(dbPath, "s1", "Terraform", "module deployment", "Terraform - module deployment", makeSessionEmbedding());
 
@@ -142,42 +118,24 @@ describe("buildSessionContext", () => {
     assert.ok(ctx !== null);
     assert.ok(ctx!.includes("Recent work in other projects"), "Should have cross-project section");
     assert.ok(ctx!.includes("other/repo"), "Should show shortened path");
+    assert.ok(ctx!.includes("Terraform - module deployment"), "Should show session name");
   });
 
   it("handles both same-cwd and cross-project in one context", async () => {
     await initDb(dbPath);
 
-    // Same-cwd memory
-    await insertMemory(
-      dbPath,
-      makeRecord({
-        id: "same",
-        sessionId: "old",
-        cwd: "/my/project",
-        summary: "Updated dbt models",
-      }),
-      makeEmbedding(),
-    );
+    await upsertSession(dbPath, makeSessionRecord({ id: "same", cwd: "/my/project" }));
+    await updateSessionName(dbPath, "same", "DBT", "model updates", "DBT - model updates", makeSessionEmbedding());
+    await updateSessionDescription(dbPath, "same", "Updated dbt models for billing pipeline.", []);
 
-    // Cross-project: needs a named session
-    await insertMemory(
-      dbPath,
-      makeRecord({
-        id: "cross",
-        sessionId: "cross-session",
-        cwd: "/other/project",
-        summary: "Fixed CI pipeline",
-      }),
-      makeEmbedding(),
-    );
-    await upsertSession(dbPath, makeSessionRecord({ id: "cross-session", cwd: "/other/project" }));
-    await updateSessionName(dbPath, "cross-session", "CI Pipeline", "fix flaky tests", "CI Pipeline - fix flaky tests", makeSessionEmbedding());
+    await upsertSession(dbPath, makeSessionRecord({ id: "cross", cwd: "/other/project" }));
+    await updateSessionName(dbPath, "cross", "CI Pipeline", "fix flaky tests", "CI Pipeline - fix flaky tests", makeSessionEmbedding());
 
     const ctx = await buildSessionContext(dbPath, "/my/project", "current-session");
     assert.ok(ctx !== null);
     assert.ok(ctx!.includes("Recent work in this directory"));
     assert.ok(ctx!.includes("Recent work in other projects"));
-    assert.ok(ctx!.includes("Updated dbt models"));
+    assert.ok(ctx!.includes("DBT - model updates"));
     assert.ok(ctx!.includes("CI Pipeline - fix flaky tests"), "Cross-project should show session name");
   });
 });
@@ -243,6 +201,8 @@ function makeSessionRecord(overrides: Partial<SessionRecord> = {}): SessionRecor
     name: null,
     mainTopic: null,
     subTopic: null,
+    description: null,
+    filesTouched: [],
     timestamp: Date.now(),
     namedAt: null,
     ...overrides,
@@ -261,46 +221,32 @@ describe("buildSessionContext — session chapter headings", () => {
     if (tmpDir && fs.existsSync(tmpDir)) fs.rmSync(tmpDir, { recursive: true, force: true });
   });
 
-  it("uses session name as chapter heading instead of time-proximity grouping", async () => {
+  it("uses session name as chapter heading with description body", async () => {
     await initDb(dbPath);
 
-    // Named session with two memories
     const s = makeSessionRecord({ id: "old-session", cwd: "/my/project", timestamp: Date.now() - 86400000 });
     await upsertSession(dbPath, s);
     await updateSessionName(dbPath, "old-session", "GCP Billing", "cost export fix", "GCP Billing - cost export fix", makeSessionEmbedding());
-
-    await insertMemory(dbPath, makeRecord({
-      id: "m1", sessionId: "old-session", cwd: "/my/project",
-      summary: "Rewrote the export query", timestamp: Date.now() - 86400000,
-    }), makeEmbedding());
-    await insertMemory(dbPath, makeRecord({
-      id: "m2", sessionId: "old-session", cwd: "/my/project",
-      summary: "Added partition pruning", timestamp: Date.now() - 86300000,
-    }), makeEmbedding());
+    await updateSessionDescription(dbPath, "old-session",
+      "Rewrote the export query and added partition pruning to fix billing cost export.",
+      ["/my/project/models/billing.sql"],
+    );
 
     const ctx = await buildSessionContext(dbPath, "/my/project", "current-session");
     assert.ok(ctx !== null);
-    assert.ok(ctx!.includes("GCP Billing - cost export fix"), "Session name should be the chapter heading");
-    assert.ok(ctx!.includes("Rewrote the export query"));
-    assert.ok(ctx!.includes("Added partition pruning"));
+    assert.ok(ctx!.includes("GCP Billing - cost export fix"), "Session name should be the heading");
+    assert.ok(ctx!.includes("Rewrote the export query"), "Description should appear");
+    assert.ok(ctx!.includes("billing.sql"), "Files should appear");
   });
 
-  it("falls back to date heading for unnamed sessions", async () => {
+  it("falls back gracefully for unnamed sessions (not shown)", async () => {
     await initDb(dbPath);
 
-    // Session in DB but not yet named
+    // Unnamed session — should not appear since we only show named sessions now
     await upsertSession(dbPath, makeSessionRecord({ id: "old-session", cwd: "/my/project" }));
 
-    await insertMemory(dbPath, makeRecord({
-      id: "m1", sessionId: "old-session", cwd: "/my/project",
-      summary: "Did some exploratory work",
-    }), makeEmbedding());
-
     const ctx = await buildSessionContext(dbPath, "/my/project", "current-session");
-    assert.ok(ctx !== null);
-    assert.ok(ctx!.includes("Did some exploratory work"));
-    // Should fall back to a date-based heading, not crash or show null
-    assert.ok(!ctx!.includes("null"), "Should not render 'null' as a heading");
+    assert.equal(ctx, null, "Unnamed sessions without cross-project data should produce null");
   });
 
   it("shows session names for cross-project recent work", async () => {
@@ -310,21 +256,15 @@ describe("buildSessionContext — session chapter headings", () => {
     await upsertSession(dbPath, s);
     await updateSessionName(dbPath, "other-session", "Metabase", "Cloud Run upgrade", "Metabase - Cloud Run upgrade", makeSessionEmbedding());
 
-    await insertMemory(dbPath, makeRecord({
-      id: "m1", sessionId: "other-session", cwd: "/other/project",
-      summary: "Upgraded Metabase to v0.59",
-    }), makeEmbedding());
-
     const ctx = await buildSessionContext(dbPath, "/my/project", "current-session");
     assert.ok(ctx !== null);
     assert.ok(ctx!.includes("Metabase - Cloud Run upgrade"), "Cross-project entry should show session name");
   });
 
-  it("groups memories by real session id, not time proximity", async () => {
+  it("shows multiple named sessions in recency order", async () => {
     await initDb(dbPath);
     const now = Date.now();
 
-    // Two sessions whose memories interleave in timestamp but belong to different sessions
     const sA = makeSessionRecord({ id: "session-a", cwd: "/my/project", timestamp: now - 10000 });
     const sB = makeSessionRecord({ id: "session-b", cwd: "/my/project", timestamp: now - 5000 });
     await upsertSession(dbPath, sA);
@@ -332,82 +272,49 @@ describe("buildSessionContext — session chapter headings", () => {
     await updateSessionName(dbPath, "session-a", "Topic A", "alpha", "Topic A - alpha", makeSessionEmbedding());
     await updateSessionName(dbPath, "session-b", "Topic B", "beta", "Topic B - beta", makeSessionEmbedding());
 
-    // Memories from session A and B with interleaved timestamps
-    await insertMemory(dbPath, makeRecord({ id: "a1", sessionId: "session-a", cwd: "/my/project", timestamp: now - 9000 }), makeEmbedding());
-    await insertMemory(dbPath, makeRecord({ id: "b1", sessionId: "session-b", cwd: "/my/project", timestamp: now - 8000 }), makeEmbedding());
-    await insertMemory(dbPath, makeRecord({ id: "a2", sessionId: "session-a", cwd: "/my/project", timestamp: now - 7000 }), makeEmbedding());
-
     const ctx = await buildSessionContext(dbPath, "/my/project", "current-session");
     assert.ok(ctx !== null);
-    // Both chapter headings should appear
     assert.ok(ctx!.includes("Topic A - alpha"), "Session A heading should appear");
     assert.ok(ctx!.includes("Topic B - beta"), "Session B heading should appear");
+    // B is more recent — should appear before A
+    assert.ok(ctx!.indexOf("Topic B") < ctx!.indexOf("Topic A"), "More recent session should appear first");
   });
 });
 
 // ---------------------------------------------------------------------------
-// Files-in-scope filter: only project-relative paths
+// Files in context: stored on session via updateSessionDescription
 // ---------------------------------------------------------------------------
 
-describe("buildSessionContext — files in scope filtering", () => {
+describe("buildSessionContext — files in scope", () => {
   beforeEach(() => { dbPath = setup(); });
   afterEach(() => {
     if (tmpDir && fs.existsSync(tmpDir)) fs.rmSync(tmpDir, { recursive: true, force: true });
   });
 
-  it("shows files that are under the project cwd", async () => {
+  it("shows files stored on the session", async () => {
     await initDb(dbPath);
 
-    await insertMemory(dbPath, makeRecord({
-      id: "m1",
-      sessionId: "old",
-      cwd: "/my/project",
-      filesTouched: ["/my/project/src/billing.ts", "/my/project/tests/billing.test.ts"],
-      summary: "Updated billing module",
-    }), makeEmbedding());
+    await upsertSession(dbPath, makeSessionRecord({ id: "s1", cwd: "/my/project" }));
+    await updateSessionName(dbPath, "s1", "Billing", "module update", "Billing - module update", makeSessionEmbedding());
+    await updateSessionDescription(dbPath, "s1", "Updated the billing module.", [
+      "/my/project/src/billing.ts",
+      "/my/project/tests/billing.test.ts",
+    ]);
 
     const ctx = await buildSessionContext(dbPath, "/my/project", "current");
     assert.ok(ctx !== null);
     assert.ok(ctx!.includes("billing.ts"), "Project files should appear");
   });
 
-  it("excludes files outside the project cwd (tmp, downloads, home config)", async () => {
+  it("shows no files line when session has no files", async () => {
     await initDb(dbPath);
 
-    await insertMemory(dbPath, makeRecord({
-      id: "m1",
-      sessionId: "old",
-      cwd: "/my/project",
-      filesTouched: [
-        "/my/project/src/billing.ts",  // keep
-        "/tmp/fetch-abc123.html",       // exclude
-        "/var/folders/xyz/cache.json",  // exclude
-        `${os.homedir()}/.pi/agent/memory/memory.db`, // exclude
-      ],
-      summary: "Did some work",
-    }), makeEmbedding());
+    await upsertSession(dbPath, makeSessionRecord({ id: "s1", cwd: "/my/project" }));
+    await updateSessionName(dbPath, "s1", "Research", "exploration", "Research - exploration", makeSessionEmbedding());
+    await updateSessionDescription(dbPath, "s1", "Did some exploratory research.", []);
 
     const ctx = await buildSessionContext(dbPath, "/my/project", "current");
     assert.ok(ctx !== null);
-    assert.ok(ctx!.includes("billing.ts"), "Project file should be present");
-    assert.ok(!ctx!.includes("/tmp/"), "Temp files should be excluded");
-    assert.ok(!ctx!.includes("/var/"), "Var files should be excluded");
-    assert.ok(!ctx!.includes(".pi/agent/memory"), "Home config files should be excluded");
-  });
-
-  it("shows no files section when all files are outside the project", async () => {
-    await initDb(dbPath);
-
-    await insertMemory(dbPath, makeRecord({
-      id: "m1",
-      sessionId: "old",
-      cwd: "/my/project",
-      filesTouched: ["/tmp/fetch-abc123.html", "/tmp/result.json"],
-      summary: "Fetched some web content",
-    }), makeEmbedding());
-
-    const ctx = await buildSessionContext(dbPath, "/my/project", "current");
-    assert.ok(ctx !== null);
-    assert.ok(!ctx!.includes("Files in scope"), "Should not show files section when all are external");
+    assert.ok(!ctx!.includes("Files:"), "Should not show files line when empty");
   });
 });

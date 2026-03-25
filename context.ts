@@ -1,14 +1,13 @@
-import * as path from "node:path";
-import { getRecentForCwd, getRecentSessions, getRecentSessionsCrossProject } from "./db.js";
+import { getRecentSessions, getRecentSessionsCrossProject } from "./db.js";
 import type { SearchResult, SessionRecord } from "./types.js";
 
 /**
  * Build the context string injected at the start of a new coding session.
  *
  * Structure:
- *   1. Recent sessions in this directory — named sessions as chapter headings,
- *      with their memories listed beneath. Falls back to a date heading for
- *      sessions not yet named.
+ *   1. Recent sessions in this directory — one entry per session using the
+ *      LLM-generated description (prose summary) + files in scope.
+ *      Falls back to memory bullets for sessions without a description yet.
  *   2. Recent named sessions in other projects — one line per project.
  */
 export async function buildSessionContext(
@@ -18,13 +17,11 @@ export async function buildSessionContext(
 ): Promise<string | null> {
   const excludeId = currentSessionId ?? "";
 
-  let memories: SearchResult[];
   let recentSessions: SessionRecord[];
   let crossProjectSessions: SessionRecord[];
 
   try {
-    [memories, recentSessions, crossProjectSessions] = await Promise.all([
-      getRecentForCwd(dbPath, cwd, currentSessionId, 25),
+    [recentSessions, crossProjectSessions] = await Promise.all([
       getRecentSessions(dbPath, cwd, excludeId, 5),
       getRecentSessionsCrossProject(dbPath, cwd, 8),
     ]);
@@ -33,46 +30,31 @@ export async function buildSessionContext(
     return null;
   }
 
-  if (memories.length === 0 && recentSessions.length === 0 && crossProjectSessions.length === 0) {
+  if (recentSessions.length === 0 && crossProjectSessions.length === 0) {
     return null;
   }
 
   const parts: string[] = [];
 
   // -------------------------------------------------------------------------
-  // Same-cwd: session chapter headings
+  // Same-cwd: one entry per recent session
   // -------------------------------------------------------------------------
-  if (memories.length > 0 || recentSessions.length > 0) {
+  if (recentSessions.length > 0) {
     parts.push("## Memory: Recent work in this directory");
 
-    // Build a lookup of named sessions by id
-    const sessionMap = new Map<string, SessionRecord>();
-    for (const s of recentSessions) sessionMap.set(s.id, s);
+    for (const session of recentSessions.slice(0, 5)) {
+      const date = formatDate(session.timestamp);
+      const heading = session.name ?? date;
+      parts.push(`\n**${heading}** (${date})`);
 
-    // Group memories by session_id
-    const bySession = groupMemoriesBySession(memories);
+      if (session.description) {
+        parts.push(session.description);
+      }
 
-    // Render: named sessions first (in recency order), then any unnamed groups
-    const renderedSessionIds = new Set<string>();
-    let sessionsRendered = 0;
-
-    // Walk named sessions in order (most recent first) — up to 3
-    for (const session of recentSessions) {
-      if (sessionsRendered >= 3) break;
-      const sessionMemories = bySession.get(session.id) ?? [];
-      renderedSessionIds.add(session.id);
-      parts.push(renderSessionSection(session.name!, session.timestamp, sessionMemories, cwd));
-      sessionsRendered++;
-    }
-
-    // Render any memory groups whose session_id wasn't in the named sessions table
-    for (const [sessionId, groupMemories] of bySession) {
-      if (sessionsRendered >= 3) break;
-      if (renderedSessionIds.has(sessionId)) continue;
-      // Fall back to date heading
-      const heading = formatDate(groupMemories[0].timestamp);
-      parts.push(renderSessionSection(heading, groupMemories[0].timestamp, groupMemories, cwd));
-      sessionsRendered++;
+      if (session.filesTouched.length > 0) {
+        const files = session.filesTouched.slice(0, 8).join(", ");
+        parts.push(`*Files: ${files}*`);
+      }
     }
   }
 
@@ -90,85 +72,6 @@ export async function buildSessionContext(
   }
 
   return parts.length > 0 ? parts.join("\n") : null;
-}
-
-// ---------------------------------------------------------------------------
-// Rendering helpers
-// ---------------------------------------------------------------------------
-
-function renderSessionSection(
-  heading: string,
-  timestamp: number,
-  memories: SearchResult[],
-  projectCwd: string,
-): string {
-  const lines: string[] = [`\n**${heading}**`];
-
-  const sessionFiles = new Set<string>();
-  for (const m of memories) {
-    const tags = m.topics.length > 0 ? ` [${m.topics.join(", ")}]` : "";
-    lines.push(`- ${m.summary}${tags}`);
-    for (const f of m.filesTouched) {
-      if (isProjectFile(f, projectCwd)) sessionFiles.add(f);
-    }
-  }
-
-  if (sessionFiles.size > 0) {
-    const fileList = Array.from(sessionFiles).slice(0, 10).join(", ");
-    lines.push(`  *Files in scope: ${fileList}*`);
-  }
-
-  return lines.join("\n");
-}
-
-/**
- * Group memories by their session_id. Memories without a session_id are
- * grouped by time proximity (2-hour window) as a fallback.
- * Returns a Map ordered by most-recent session first.
- */
-function groupMemoriesBySession(
-  memories: SearchResult[],
-): Map<string, SearchResult[]> {
-  const map = new Map<string, SearchResult[]>();
-
-  for (const m of memories) {
-    if (m.sessionId) {
-      const group = map.get(m.sessionId) ?? [];
-      group.push(m);
-      map.set(m.sessionId, group);
-    } else {
-      // Legacy: no session_id — group by time proximity
-      const legacyKey = findOrCreateLegacyGroup(map, m.timestamp);
-      map.get(legacyKey)!.push(m);
-    }
-  }
-
-  return map;
-}
-
-/** Find an existing legacy group whose last timestamp is within 2h, or create one. */
-function findOrCreateLegacyGroup(
-  map: Map<string, SearchResult[]>,
-  timestamp: number,
-): string {
-  const twoHours = 2 * 60 * 60 * 1000;
-  for (const [key, group] of map) {
-    if (!key.startsWith("__legacy__")) continue;
-    const lastTs = group[group.length - 1].timestamp;
-    if (Math.abs(timestamp - lastTs) < twoHours) return key;
-  }
-  const key = `__legacy__${timestamp}`;
-  map.set(key, []);
-  return key;
-}
-
-/**
- * Returns true if the file path is within the project's cwd.
- * Excludes temp files, downloaded content, and home directory config paths.
- */
-function isProjectFile(filePath: string, projectCwd: string): boolean {
-  const resolved = path.resolve(filePath);
-  return resolved.startsWith(projectCwd);
 }
 
 // ---------------------------------------------------------------------------

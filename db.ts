@@ -51,17 +51,24 @@ CREATE TABLE IF NOT EXISTS sessions (
     name         TEXT,
     main_topic   TEXT,
     sub_topic    TEXT,
+    description  TEXT,
+    files_touched TEXT NOT NULL DEFAULT '[]',
     embedding    BLOB,
     timestamp    INTEGER NOT NULL,
     named_at     INTEGER
 );
+
+-- Add columns if upgrading from older schema
+CREATE TABLE IF NOT EXISTS _migrations (key TEXT PRIMARY KEY);
+
 
 CREATE INDEX IF NOT EXISTS idx_sessions_cwd ON sessions(cwd);
 CREATE INDEX IF NOT EXISTS idx_sessions_ts ON sessions(timestamp DESC);
 `;
 
 const SESSIONS_MIGRATIONS = [
-  // future migrations go here
+  `ALTER TABLE sessions ADD COLUMN description TEXT`,
+  `ALTER TABLE sessions ADD COLUMN files_touched TEXT NOT NULL DEFAULT '[]'`,
 ];
 
 // vec0 virtual table — cosine distance, with cwd as a metadata column for
@@ -515,6 +522,47 @@ export async function updateSessionName(
 }
 
 /**
+ * Return all memory summaries and files for a given session, for use in
+ * generating a holistic session description.
+ */
+export async function getSessionMemoriesForSummary(
+  dbPath: string,
+  sessionId: string,
+): Promise<{ summaries: string[]; filesTouched: string[] }> {
+  const db = getDb(dbPath);
+  const rows = db
+    .prepare(
+      `SELECT summary, files_touched FROM memories
+       WHERE session_id = ? AND type = 'memory'
+       ORDER BY timestamp ASC`,
+    )
+    .all(sessionId) as any[];
+
+  const summaries: string[] = rows.map((r) => r.summary);
+  const allFiles = new Set<string>();
+  for (const r of rows) {
+    for (const f of safeJsonParse(r.files_touched, [])) allFiles.add(f);
+  }
+
+  return { summaries, filesTouched: Array.from(allFiles) };
+}
+
+/**
+ * Store a generated description and aggregate files_touched on a session.
+ */
+export async function updateSessionDescription(
+  dbPath: string,
+  sessionId: string,
+  description: string,
+  filesTouched: string[],
+): Promise<void> {
+  const db = getDb(dbPath);
+  db.prepare(
+    `UPDATE sessions SET description = ?, files_touched = ? WHERE id = ?`,
+  ).run(description, JSON.stringify(filesTouched), sessionId);
+}
+
+/**
  * Return recent named sessions for a given cwd, excluding the current session.
  */
 export async function getRecentSessions(
@@ -526,7 +574,7 @@ export async function getRecentSessions(
   const db = getDb(dbPath);
   const rows = db
     .prepare(
-      `SELECT id, cwd, session_file, name, main_topic, sub_topic, timestamp, named_at
+      `SELECT id, cwd, session_file, name, main_topic, sub_topic, description, files_touched, timestamp, named_at
        FROM sessions
        WHERE cwd = ? AND id != ? AND name IS NOT NULL
        ORDER BY timestamp DESC
@@ -541,6 +589,8 @@ export async function getRecentSessions(
     name: r.name,
     mainTopic: r.main_topic ?? null,
     subTopic: r.sub_topic ?? null,
+    description: r.description ?? null,
+    filesTouched: safeJsonParse(r.files_touched, []),
     timestamp: r.timestamp,
     namedAt: r.named_at ?? null,
   }));
@@ -558,7 +608,7 @@ export async function getRecentSessionsCrossProject(
   const db = getDb(dbPath);
   const rows = db
     .prepare(
-      `SELECT s.id, s.cwd, s.session_file, s.name, s.main_topic, s.sub_topic, s.timestamp, s.named_at
+      `SELECT s.id, s.cwd, s.session_file, s.name, s.main_topic, s.sub_topic, s.description, s.files_touched, s.timestamp, s.named_at
        FROM sessions s
        INNER JOIN (
          SELECT cwd, MAX(timestamp) as max_ts
@@ -578,6 +628,8 @@ export async function getRecentSessionsCrossProject(
     name: r.name,
     mainTopic: r.main_topic ?? null,
     subTopic: r.sub_topic ?? null,
+    description: r.description ?? null,
+    filesTouched: safeJsonParse(r.files_touched, []),
     timestamp: r.timestamp,
     namedAt: r.named_at ?? null,
   }));
@@ -620,6 +672,8 @@ export async function findSimilarSessions(
     name: r.name,
     mainTopic: r.main_topic ?? null,
     subTopic: r.sub_topic ?? null,
+    description: null,
+    filesTouched: [],
     timestamp: r.timestamp,
     namedAt: r.named_at ?? null,
   }));

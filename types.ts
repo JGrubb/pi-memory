@@ -39,6 +39,8 @@ export interface SessionRecord {
   name: string | null;
   mainTopic: string | null;
   subTopic: string | null;
+  description: string | null;
+  filesTouched: string[];
   timestamp: number;
   namedAt: number | null;
 }

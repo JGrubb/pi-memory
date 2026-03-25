@@ -170,6 +170,56 @@ export async function nameSession(
   }
 }
 
+const SESSION_SUMMARY_PROMPT = `You are summarizing a coding session from a list of memory entries.
+
+Write a 2-3 sentence narrative paragraph describing:
+- What the overall goal or problem was
+- What was built, changed, or decided
+- The current state / outcome
+
+Be specific: mention key technologies, file names, and decisions. Write in past tense. Do NOT use bullet points — write flowing prose.
+
+<memories>
+{{MEMORIES}}
+</memories>
+
+Respond with ONLY the paragraph. No title, no markdown, no explanation.`;
+
+export async function summarizeSession(
+  memorySummaries: string[],
+  config: Config,
+): Promise<string> {
+  const memoriesText = memorySummaries.map((s, i) => `${i + 1}. ${s}`).join("\n");
+  const prompt = SESSION_SUMMARY_PROMPT.replace("{{MEMORIES}}", memoriesText);
+  let raw: string;
+
+  if (config.summarizeProvider === "anthropic") {
+    const data = await anthropicFetch({
+      model: config.summarizeModel,
+      max_tokens: 256,
+      messages: [{ role: "user", content: prompt }],
+    });
+    raw = data.content[0].text;
+  } else if (config.summarizeModel.startsWith("claude")) {
+    const url = vertexUrl(config, "anthropic", config.summarizeModel, "rawPredict");
+    const data = await vertexFetch(url, {
+      anthropic_version: "vertex-2023-10-16",
+      max_tokens: 256,
+      messages: [{ role: "user", content: prompt }],
+    });
+    raw = data.content[0].text;
+  } else {
+    const url = vertexUrl(config, "google", config.summarizeModel, "streamGenerateContent");
+    const data = await vertexFetch(url, {
+      contents: [{ role: "user", parts: [{ text: prompt }] }],
+      generationConfig: { maxOutputTokens: 256, temperature: 0.2 },
+    });
+    raw = data[0].candidates[0].content.parts[0].text;
+  }
+
+  return raw.trim();
+}
+
 const EXTRACTION_PROMPT = `Extract a concise memory from this coding session interaction.
 
 Return a JSON object with exactly these fields:

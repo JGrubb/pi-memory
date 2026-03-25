@@ -5,8 +5,8 @@ import { randomUUID } from "node:crypto";
 import * as os from "node:os";
 import * as path from "node:path";
 
-import { initDb, insertMemory, searchByVector, getStats, getPendingRecords, updateMemoryAfterRetry, upsertSession, updateSessionName, findSimilarSessions, getBackfillCandidates, appendSessionInfoToJSONL } from "./db.js";
-import { embedText, summarizeInteraction, nameSession } from "./vertex.js";
+import { initDb, insertMemory, searchByVector, getStats, getPendingRecords, updateMemoryAfterRetry, upsertSession, updateSessionName, findSimilarSessions, getBackfillCandidates, appendSessionInfoToJSONL, getSessionMemoriesForSummary, updateSessionDescription } from "./db.js";
+import { embedText, summarizeInteraction, nameSession, summarizeSession } from "./vertex.js";
 import { buildSessionContext, formatSearchResults } from "./context.js";
 import type { Config, MemoryRecord, ExtractedContent } from "./types.js";
 
@@ -42,6 +42,7 @@ let dbReady = false;
 let injectedThisSession = false;
 let cachedContext: string | null = null;
 let currentSessionId: string | null = null;
+let previousSessionId: string | null = null;
 let currentCwd: string | null = null;
 
 // Track in-flight stores so we can await them on shutdown
@@ -235,6 +236,19 @@ async function retryPendingRecords(): Promise<void> {
 // Session naming + backfill
 // ---------------------------------------------------------------------------
 
+/**
+ * If the previous session has memories but no description yet, generate one.
+ * Called at session start/switch so it runs once per new session.
+ */
+async function summarizePreviousSession(previousSessionId: string): Promise<void> {
+  const { summaries, filesTouched } = await getSessionMemoriesForSummary(CONFIG.dbPath, previousSessionId);
+  if (summaries.length === 0) return;
+
+  const description = await summarizeSession(summaries, CONFIG);
+  await updateSessionDescription(CONFIG.dbPath, previousSessionId, description, filesTouched);
+  console.log(`[memory] Summarized previous session (${summaries.length} memories)`);
+}
+
 async function runBackfill(sessionsDir: string): Promise<void> {
   const candidates = await getBackfillCandidates(CONFIG.dbPath, sessionsDir, 5);
   if (candidates.length === 0) return;
@@ -329,6 +343,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => {
     injectedThisSession = false;
     cachedContext = null;
+    previousSessionId = currentSessionId;
     currentSessionId = ctx.sessionManager.getSessionId() ?? randomUUID();
     currentCwd = ctx.cwd;
     agentEndCount = 0;
@@ -366,6 +381,13 @@ export default function (pi: ExtensionAPI) {
       namedAt: null,
     }).catch((err) => console.error("[memory] Session upsert failed:", err));
 
+    // Summarize the previous session if it has memories but no description yet
+    if (previousSessionId) {
+      summarizePreviousSession(previousSessionId).catch((err) =>
+        console.error("[memory] Previous session summarization failed:", err),
+      );
+    }
+
     try {
       cachedContext = await buildSessionContext(CONFIG.dbPath, ctx.cwd, currentSessionId);
       if (cachedContext) {
@@ -398,6 +420,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_switch", async (_event, ctx) => {
     injectedThisSession = false;
+    previousSessionId = currentSessionId;
     currentSessionId = ctx.sessionManager.getSessionId() ?? randomUUID();
     currentCwd = ctx.cwd;
     agentEndCount = 0;
@@ -417,6 +440,13 @@ export default function (pi: ExtensionAPI) {
       timestamp: Date.now(),
       namedAt: null,
     }).catch((err) => console.error("[memory] Session upsert failed:", err));
+
+    // Summarize the previous session if it has memories but no description yet
+    if (previousSessionId) {
+      summarizePreviousSession(previousSessionId).catch((err) =>
+        console.error("[memory] Previous session summarization failed:", err),
+      );
+    }
 
     try {
       cachedContext = await buildSessionContext(CONFIG.dbPath, ctx.cwd, currentSessionId);
