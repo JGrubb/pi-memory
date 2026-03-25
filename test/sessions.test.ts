@@ -10,7 +10,8 @@ import {
   updateSessionName,
   getRecentSessions,
   findSimilarSessions,
-  backfillSessionsFromJSONL,
+  getBackfillCandidates,
+  appendSessionInfoToJSONL,
   closeAll,
 } from "../db.js";
 import type { SessionRecord } from "../types.js";
@@ -83,46 +84,50 @@ function writeSessionFile(
     sessionId: string;
     firstPrompt: string;
     name?: string;
+    turns?: number;      // number of user turns to write (default 1)
+    timestamp?: string;  // ISO timestamp for session header
   },
 ): string {
   const filePath = path.join(dir, filename);
+  const sessionTs = opts.timestamp ?? new Date().toISOString();
+  const numTurns = opts.turns ?? 1;
+
   const lines: object[] = [
-    {
-      type: "session",
-      version: 3,
-      id: opts.sessionId,
-      timestamp: new Date().toISOString(),
-      cwd: opts.cwd,
-    },
-    {
+    { type: "session", version: 3, id: opts.sessionId, timestamp: sessionTs, cwd: opts.cwd },
+  ];
+
+  let lastId: string | null = null;
+  for (let i = 0; i < numTurns; i++) {
+    const userId = `usr${String(i).padStart(5, "0")}`;
+    const assistId = `ast${String(i).padStart(5, "0")}`;
+    const prompt = i === 0 ? opts.firstPrompt : `Follow-up question ${i}`;
+
+    lines.push({
       type: "message",
-      id: "aaa00001",
-      parentId: null,
+      id: userId,
+      parentId: lastId,
       timestamp: new Date().toISOString(),
-      message: {
-        role: "user",
-        content: opts.firstPrompt,
-        timestamp: Date.now(),
-      },
-    },
-    {
+      message: { role: "user", content: prompt, timestamp: Date.now() },
+    });
+    lines.push({
       type: "message",
-      id: "aaa00002",
-      parentId: "aaa00001",
+      id: assistId,
+      parentId: userId,
       timestamp: new Date().toISOString(),
       message: {
         role: "assistant",
-        content: [{ type: "text", text: "Sure, I can help with that." }],
+        content: [{ type: "text", text: `Response to turn ${i + 1}.` }],
         timestamp: Date.now(),
       },
-    },
-  ];
+    });
+    lastId = assistId;
+  }
 
   if (opts.name) {
     lines.push({
       type: "session_info",
-      id: "aaa00003",
-      parentId: "aaa00002",
+      id: "nameentry",
+      parentId: lastId,
       timestamp: new Date().toISOString(),
       name: opts.name,
     });
@@ -379,138 +384,69 @@ describe("findSimilarSessions", () => {
   });
 });
 
-describe("backfillSessionsFromJSONL", () => {
+describe("getBackfillCandidates", () => {
   beforeEach(() => { dbPath = makeDbPath(); });
   afterEach(() => {
     closeAll();
     if (tmpDir && fs.existsSync(tmpDir)) fs.rmSync(tmpDir, { recursive: true, force: true });
   });
 
-  it("imports named sessions from JSONL files into the sessions table", async () => {
+  it("returns sessions with enough turns that are not yet named", async () => {
     await initDb(dbPath);
-
-    // Create a fake pi sessions directory structure
     const sessionsDir = path.join(tmpDir, "sessions");
-    const projectDir = path.join(sessionsDir, "--Users-test-project--");
+    const projectDir = path.join(sessionsDir, "--project--");
     fs.mkdirSync(projectDir, { recursive: true });
 
-    writeSessionFile(projectDir, "session1.jsonl", {
-      sessionId: "uuid-1",
-      cwd: "/Users/test/project",
-      firstPrompt: "Help me with billing",
-      name: "GCP Billing - cost export fix",
-    });
-
-    await backfillSessionsFromJSONL(dbPath, sessionsDir);
-
-    const recent = await getRecentSessions(dbPath, "/Users/test/project", "other", 10);
-    assert.equal(recent.length, 1);
-    assert.equal(recent[0].id, "uuid-1");
-    assert.equal(recent[0].name, "GCP Billing - cost export fix");
-  });
-
-  it("skips unnamed sessions (no session_info entry)", async () => {
-    await initDb(dbPath);
-
-    const sessionsDir = path.join(tmpDir, "sessions");
-    const projectDir = path.join(sessionsDir, "--Users-test-project--");
-    fs.mkdirSync(projectDir, { recursive: true });
-
-    writeSessionFile(projectDir, "unnamed.jsonl", {
-      sessionId: "uuid-unnamed",
-      cwd: "/Users/test/project",
-      firstPrompt: "Quick question",
-      // no name
-    });
-
-    await backfillSessionsFromJSONL(dbPath, sessionsDir);
-
-    const recent = await getRecentSessions(dbPath, "/Users/test/project", "other", 10);
-    assert.equal(recent.length, 0, "Unnamed sessions should not appear");
-  });
-
-  it("skips sessions already in the table", async () => {
-    await initDb(dbPath);
-
-    const sessionsDir = path.join(tmpDir, "sessions");
-    const projectDir = path.join(sessionsDir, "--Users-test-project--");
-    fs.mkdirSync(projectDir, { recursive: true });
-
-    const filePath = writeSessionFile(projectDir, "session1.jsonl", {
-      sessionId: "uuid-1",
-      cwd: "/Users/test/project",
+    writeSessionFile(projectDir, "long.jsonl", {
+      sessionId: "uuid-long",
+      cwd: "/project",
       firstPrompt: "Help me",
+      turns: 6,
+    });
+
+    const candidates = await getBackfillCandidates(dbPath, sessionsDir, 5);
+    assert.equal(candidates.length, 1);
+    assert.equal(candidates[0].sessionId, "uuid-long");
+    assert.equal(candidates[0].userTurnCount, 6);
+  });
+
+  it("skips sessions with fewer than minTurns", async () => {
+    await initDb(dbPath);
+    const sessionsDir = path.join(tmpDir, "sessions");
+    const projectDir = path.join(sessionsDir, "--project--");
+    fs.mkdirSync(projectDir, { recursive: true });
+
+    writeSessionFile(projectDir, "short.jsonl", {
+      sessionId: "uuid-short",
+      cwd: "/project",
+      firstPrompt: "Quick question",
+      turns: 2,
+    });
+
+    const candidates = await getBackfillCandidates(dbPath, sessionsDir, 5);
+    assert.equal(candidates.length, 0);
+  });
+
+  it("skips sessions that already have a session_info entry in the JSONL", async () => {
+    await initDb(dbPath);
+    const sessionsDir = path.join(tmpDir, "sessions");
+    const projectDir = path.join(sessionsDir, "--project--");
+    fs.mkdirSync(projectDir, { recursive: true });
+
+    writeSessionFile(projectDir, "named.jsonl", {
+      sessionId: "uuid-named",
+      cwd: "/project",
+      firstPrompt: "Help me",
+      turns: 6,
       name: "GCP Billing - cost export fix",
     });
 
-    // Pre-insert the session record
-    await upsertSession(dbPath, makeSession({ id: "uuid-1", cwd: "/Users/test/project", sessionFile: filePath }));
-
-    await backfillSessionsFromJSONL(dbPath, sessionsDir);
-
-    // Should still be exactly one row
-    const recent = await getRecentSessions(dbPath, "/Users/test/project", "other", 10);
-    assert.equal(recent.length, 1);
+    const candidates = await getBackfillCandidates(dbPath, sessionsDir, 5);
+    assert.equal(candidates.length, 0);
   });
 
-  it("handles multiple project directories", async () => {
+  it("skips sessions already named in the sessions table", async () => {
     await initDb(dbPath);
-
-    const sessionsDir = path.join(tmpDir, "sessions");
-    fs.mkdirSync(path.join(sessionsDir, "--Users-test-project-a--"), { recursive: true });
-    fs.mkdirSync(path.join(sessionsDir, "--Users-test-project-b--"), { recursive: true });
-
-    writeSessionFile(path.join(sessionsDir, "--Users-test-project-a--"), "s1.jsonl", {
-      sessionId: "uuid-a",
-      cwd: "/Users/test/project-a",
-      firstPrompt: "Help with A",
-      name: "Project A - some work",
-    });
-    writeSessionFile(path.join(sessionsDir, "--Users-test-project-b--"), "s2.jsonl", {
-      sessionId: "uuid-b",
-      cwd: "/Users/test/project-b",
-      firstPrompt: "Help with B",
-      name: "Project B - other work",
-    });
-
-    await backfillSessionsFromJSONL(dbPath, sessionsDir);
-
-    const resultsA = await getRecentSessions(dbPath, "/Users/test/project-a", "other", 10);
-    const resultsB = await getRecentSessions(dbPath, "/Users/test/project-b", "other", 10);
-    assert.equal(resultsA.length, 1);
-    assert.equal(resultsB.length, 1);
-    assert.equal(resultsA[0].id, "uuid-a");
-    assert.equal(resultsB[0].id, "uuid-b");
-  });
-
-  it("uses the last session_info entry as the canonical name", async () => {
-    await initDb(dbPath);
-
-    const sessionsDir = path.join(tmpDir, "sessions");
-    const projectDir = path.join(sessionsDir, "--Users-test-project--");
-    fs.mkdirSync(projectDir, { recursive: true });
-
-    // Write a session with two session_info entries (e.g. user renamed it)
-    const filePath = path.join(projectDir, "renamed.jsonl");
-    const lines = [
-      { type: "session", version: 3, id: "uuid-renamed", timestamp: new Date().toISOString(), cwd: "/Users/test/project" },
-      { type: "message", id: "a1", parentId: null, timestamp: new Date().toISOString(), message: { role: "user", content: "start", timestamp: Date.now() } },
-      { type: "session_info", id: "b1", parentId: "a1", timestamp: new Date().toISOString(), name: "First name" },
-      { type: "message", id: "a2", parentId: "b1", timestamp: new Date().toISOString(), message: { role: "user", content: "more", timestamp: Date.now() } },
-      { type: "session_info", id: "b2", parentId: "a2", timestamp: new Date().toISOString(), name: "Final name" },
-    ];
-    fs.writeFileSync(filePath, lines.map((l) => JSON.stringify(l)).join("\n") + "\n");
-
-    await backfillSessionsFromJSONL(dbPath, sessionsDir);
-
-    const recent = await getRecentSessions(dbPath, "/Users/test/project", "other", 10);
-    assert.equal(recent.length, 1);
-    assert.equal(recent[0].name, "Final name", "Should use the last session_info entry");
-  });
-
-  it("is idempotent — running twice does not duplicate rows", async () => {
-    await initDb(dbPath);
-
     const sessionsDir = path.join(tmpDir, "sessions");
     const projectDir = path.join(sessionsDir, "--project--");
     fs.mkdirSync(projectDir, { recursive: true });
@@ -518,14 +454,118 @@ describe("backfillSessionsFromJSONL", () => {
     writeSessionFile(projectDir, "s.jsonl", {
       sessionId: "uuid-1",
       cwd: "/project",
-      firstPrompt: "Do something",
-      name: "Topic - sub",
+      firstPrompt: "Help",
+      turns: 6,
     });
 
-    await backfillSessionsFromJSONL(dbPath, sessionsDir);
-    await backfillSessionsFromJSONL(dbPath, sessionsDir);
+    await upsertSession(dbPath, makeSession({ id: "uuid-1", cwd: "/project" }));
+    await updateSessionName(dbPath, "uuid-1", "Topic", "sub", "Topic - sub", makeEmbedding());
 
-    const recent = await getRecentSessions(dbPath, "/project", "other", 10);
-    assert.equal(recent.length, 1);
+    const candidates = await getBackfillCandidates(dbPath, sessionsDir, 5);
+    assert.equal(candidates.length, 0);
+  });
+
+  it("returns candidates sorted oldest first", async () => {
+    await initDb(dbPath);
+    const sessionsDir = path.join(tmpDir, "sessions");
+    const projectDir = path.join(sessionsDir, "--project--");
+    fs.mkdirSync(projectDir, { recursive: true });
+
+    const older = new Date(Date.now() - 86400000).toISOString();
+    const newer = new Date().toISOString();
+
+    writeSessionFile(projectDir, "newer.jsonl", {
+      sessionId: "uuid-newer",
+      cwd: "/project",
+      firstPrompt: "Newer session",
+      turns: 6,
+      timestamp: newer,
+    });
+    writeSessionFile(projectDir, "older.jsonl", {
+      sessionId: "uuid-older",
+      cwd: "/project",
+      firstPrompt: "Older session",
+      turns: 6,
+      timestamp: older,
+    });
+
+    const candidates = await getBackfillCandidates(dbPath, sessionsDir, 5);
+    assert.equal(candidates.length, 2);
+    assert.equal(candidates[0].sessionId, "uuid-older", "Oldest should be first");
+    assert.equal(candidates[1].sessionId, "uuid-newer");
+  });
+
+  it("includes conversation text from the session", async () => {
+    await initDb(dbPath);
+    const sessionsDir = path.join(tmpDir, "sessions");
+    const projectDir = path.join(sessionsDir, "--project--");
+    fs.mkdirSync(projectDir, { recursive: true });
+
+    writeSessionFile(projectDir, "s.jsonl", {
+      sessionId: "uuid-1",
+      cwd: "/project",
+      firstPrompt: "How do I fix the billing pipeline?",
+      turns: 6,
+    });
+
+    const candidates = await getBackfillCandidates(dbPath, sessionsDir, 5);
+    assert.equal(candidates.length, 1);
+    assert.ok(candidates[0].conversationText.includes("How do I fix the billing pipeline?"));
+  });
+});
+
+describe("appendSessionInfoToJSONL", () => {
+  beforeEach(() => { dbPath = makeDbPath(); });
+  afterEach(() => {
+    closeAll();
+    if (tmpDir && fs.existsSync(tmpDir)) fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("appends a session_info entry with the given name", async () => {
+    await initDb(dbPath);
+    const projectDir = path.join(tmpDir, "--project--");
+    fs.mkdirSync(projectDir, { recursive: true });
+
+    const filePath = writeSessionFile(projectDir, "s.jsonl", {
+      sessionId: "uuid-1",
+      cwd: "/project",
+      firstPrompt: "Help",
+      turns: 2,
+    });
+
+    await appendSessionInfoToJSONL(filePath, "GCP Billing - cost export fix");
+
+    const content = fs.readFileSync(filePath, "utf8");
+    const lines = content.trim().split("\n").map((l) => JSON.parse(l));
+    const sessionInfo = lines.find((e: any) => e.type === "session_info");
+
+    assert.ok(sessionInfo, "session_info entry should exist");
+    assert.equal(sessionInfo.name, "GCP Billing - cost export fix");
+    assert.ok(sessionInfo.id, "Should have an id");
+    assert.ok(sessionInfo.parentId, "Should have a parentId");
+    assert.ok(sessionInfo.timestamp, "Should have a timestamp");
+  });
+
+  it("sets parentId to the last entry's id", async () => {
+    await initDb(dbPath);
+    const projectDir = path.join(tmpDir, "--project--");
+    fs.mkdirSync(projectDir, { recursive: true });
+
+    const filePath = writeSessionFile(projectDir, "s.jsonl", {
+      sessionId: "uuid-1",
+      cwd: "/project",
+      firstPrompt: "Help",
+      turns: 2,
+    });
+
+    await appendSessionInfoToJSONL(filePath, "Topic - sub");
+
+    const content = fs.readFileSync(filePath, "utf8");
+    const lines = content.trim().split("\n").map((l) => JSON.parse(l));
+    const entries = lines.filter((e: any) => e.type !== "session" && e.id);
+    const lastEntry = entries[entries.length - 2]; // second-to-last (before session_info)
+    const sessionInfo = entries[entries.length - 1];
+
+    assert.equal(sessionInfo.parentId, lastEntry.id);
   });
 });

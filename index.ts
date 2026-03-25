@@ -5,7 +5,7 @@ import { randomUUID } from "node:crypto";
 import * as os from "node:os";
 import * as path from "node:path";
 
-import { initDb, insertMemory, searchByVector, getStats, getPendingRecords, updateMemoryAfterRetry, upsertSession, updateSessionName, findSimilarSessions, backfillSessionsFromJSONL } from "./db.js";
+import { initDb, insertMemory, searchByVector, getStats, getPendingRecords, updateMemoryAfterRetry, upsertSession, updateSessionName, findSimilarSessions, getBackfillCandidates, appendSessionInfoToJSONL } from "./db.js";
 import { embedText, summarizeInteraction, nameSession } from "./vertex.js";
 import { buildSessionContext, formatSearchResults } from "./context.js";
 import type { Config, MemoryRecord, ExtractedContent } from "./types.js";
@@ -232,8 +232,54 @@ async function retryPendingRecords(): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
-// Session naming
+// Session naming + backfill
 // ---------------------------------------------------------------------------
+
+async function runBackfill(sessionsDir: string): Promise<void> {
+  const candidates = await getBackfillCandidates(CONFIG.dbPath, sessionsDir, 5);
+  if (candidates.length === 0) return;
+
+  console.log(`[memory] Backfilling names for ${candidates.length} session(s)...`);
+
+  for (const candidate of candidates) {
+    try {
+      // Ensure session row exists before naming it
+      await upsertSession(CONFIG.dbPath, {
+        id: candidate.sessionId,
+        cwd: candidate.cwd,
+        sessionFile: candidate.filePath,
+        name: null,
+        mainTopic: null,
+        subTopic: null,
+        timestamp: candidate.timestamp,
+        namedAt: null,
+      });
+
+      const { mainTopic, subTopic } = await nameSession(candidate.conversationText, CONFIG);
+      if (!mainTopic) continue;
+
+      const embedding = await embedText(mainTopic, CONFIG, "RETRIEVAL_DOCUMENT");
+
+      // Continuation detection — works correctly because we process oldest first
+      const similar = await findSimilarSessions(CONFIG.dbPath, candidate.cwd, candidate.sessionId, embedding, 0.85);
+      const sameTopicCount = similar.filter(
+        (s) => s.mainTopic?.toLowerCase() === mainTopic.toLowerCase(),
+      ).length;
+
+      const name = sameTopicCount > 0
+        ? `${mainTopic} - ${subTopic} (cont. ${sameTopicCount + 1})`
+        : subTopic ? `${mainTopic} - ${subTopic}` : mainTopic;
+
+      await updateSessionName(CONFIG.dbPath, candidate.sessionId, mainTopic, subTopic, name, embedding);
+      await appendSessionInfoToJSONL(candidate.filePath, name);
+
+      console.log(`[memory] Named: "${name}" (${candidate.userTurnCount} turns)`);
+    } catch (err) {
+      console.error(`[memory] Backfill failed for session ${candidate.sessionId}:`, err);
+    }
+  }
+}
+
 
 async function performSessionNaming(
   messages: any[],
@@ -333,9 +379,10 @@ export default function (pi: ExtensionAPI) {
       console.error("[memory] Context build failed:", err);
     }
 
-    // One-time backfill of existing named sessions from JSONL files
+    // Backfill: name any existing sessions that hit the 5-turn threshold
+    // but haven't been named yet. Fire-and-forget — fast after first run.
     const piSessionsDir = path.join(os.homedir(), ".pi", "agent", "sessions");
-    backfillSessionsFromJSONL(CONFIG.dbPath, piSessionsDir).catch((err) =>
+    runBackfill(piSessionsDir).catch((err) =>
       console.error("[memory] Session backfill failed:", err),
     );
 

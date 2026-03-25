@@ -2,6 +2,7 @@ import Database from "better-sqlite3";
 import * as sqliteVec from "sqlite-vec";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { randomBytes } from "node:crypto";
 import type { MemoryRecord, MemoryStatus, MemoryType, SearchResult, SessionRecord } from "./types.js";
 
 // ---------------------------------------------------------------------------
@@ -624,35 +625,80 @@ export async function findSimilarSessions(
   }));
 }
 
-/**
- * One-time backfill: scan JSONL session files and import any that have a
- * session_info name entry but aren't already in the sessions table.
- * Skips embedding generation — backfilled sessions appear as chapter headings
- * but don't participate in similarity-based continuation detection.
- */
-export async function backfillSessionsFromJSONL(
-  dbPath: string,
-  sessionsDir: string,
-): Promise<void> {
-  if (!fs.existsSync(sessionsDir)) return;
+// ---------------------------------------------------------------------------
+// Backfill — find unnamed sessions and write names back to JSONL
+// ---------------------------------------------------------------------------
 
-  const db = getDb(dbPath);
-  const projectDirs = fs.readdirSync(sessionsDir).filter((d) => {
-    return fs.statSync(path.join(sessionsDir, d)).isDirectory();
-  });
+export interface BackfillCandidate {
+  filePath: string;
+  sessionId: string;
+  cwd: string;
+  timestamp: number;
+  conversationText: string;
+  userTurnCount: number;
+}
 
-  // Collect all parseable sessions across all project directories first,
-  // then sort chronologically before inserting — so the sessions table
-  // reflects the actual order work happened in.
-  interface ParsedSession {
-    filePath: string;
-    sessionId: string;
-    sessionCwd: string;
-    sessionTimestamp: number;
-    name: string;
+function extractTextFromContent(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .filter((p: any) => p?.type === "text" && typeof p.text === "string")
+    .map((p: any) => p.text)
+    .join("\n");
+}
+
+function buildConversationFromEntries(entries: any[]): { text: string; userTurns: number } {
+  const parts: string[] = [];
+  let userTurns = 0;
+
+  for (const entry of entries) {
+    if (entry.type !== "message" || !entry.message) continue;
+    const msg = entry.message;
+
+    if (msg.role === "user") {
+      const text = extractTextFromContent(msg.content).trim();
+      if (text) { parts.push(`User: ${text}`); userTurns++; }
+    } else if (msg.role === "assistant") {
+      const text = extractTextFromContent(msg.content).trim();
+      if (text) parts.push(`Assistant: ${text}`);
+      if (Array.isArray(msg.content)) {
+        for (const part of msg.content) {
+          if (part?.type === "toolCall" && part.name) {
+            const argsStr = JSON.stringify(part.arguments ?? part.input ?? {}).slice(0, 200);
+            parts.push(`[Tool: ${part.name}(${argsStr})]`);
+          }
+        }
+      }
+    }
   }
 
-  const parsed: ParsedSession[] = [];
+  const full = parts.join("\n\n");
+  return {
+    text: full.length > 6000 ? full.slice(0, 6000) + "\n...[truncated]" : full,
+    userTurns,
+  };
+}
+
+/**
+ * Scan the pi sessions directory and return sessions that:
+ * - Have at least minTurns user turns
+ * - Are not already named (no session_info in JSONL, no name in sessions table)
+ * Results are sorted oldest → newest so continuation detection works correctly
+ * when the caller processes them in order.
+ */
+export async function getBackfillCandidates(
+  dbPath: string,
+  sessionsDir: string,
+  minTurns: number = 5,
+): Promise<BackfillCandidate[]> {
+  if (!fs.existsSync(sessionsDir)) return [];
+
+  const db = getDb(dbPath);
+  const candidates: BackfillCandidate[] = [];
+
+  const projectDirs = fs.readdirSync(sessionsDir).filter((d) =>
+    fs.statSync(path.join(sessionsDir, d)).isDirectory(),
+  );
 
   for (const projectDir of projectDirs) {
     const projectPath = path.join(sessionsDir, projectDir);
@@ -663,14 +709,13 @@ export async function backfillSessionsFromJSONL(
 
       let sessionId: string | null = null;
       let sessionCwd: string | null = null;
-      let sessionTimestamp: number = Date.now();
-      let lastName: string | null = null;
+      let sessionTimestamp = Date.now();
+      let hasSessionInfo = false;
+      const entries: any[] = [];
 
       try {
         const content = fs.readFileSync(filePath, "utf8");
-        const lines = content.trim().split("\n");
-
-        for (const line of lines) {
+        for (const line of content.trim().split("\n")) {
           if (!line.trim()) continue;
           let entry: any;
           try { entry = JSON.parse(line); } catch { continue; }
@@ -679,40 +724,64 @@ export async function backfillSessionsFromJSONL(
             sessionId = entry.id ?? null;
             sessionCwd = entry.cwd ?? null;
             sessionTimestamp = entry.timestamp ? new Date(entry.timestamp).getTime() : Date.now();
-          } else if (entry.type === "session_info" && entry.name) {
-            lastName = entry.name;
+          } else if (entry.type === "session_info") {
+            hasSessionInfo = true;
+          } else {
+            entries.push(entry);
           }
         }
       } catch {
-        continue; // skip unreadable files
+        continue;
       }
 
-      if (!sessionId || !sessionCwd || !lastName) continue;
-      parsed.push({ filePath, sessionId, sessionCwd, sessionTimestamp, name: lastName });
+      if (!sessionId || !sessionCwd || hasSessionInfo) continue;
+
+      // Skip if already named in the sessions table
+      const existing = db
+        .prepare("SELECT name FROM sessions WHERE id = ?")
+        .get(sessionId) as { name: string | null } | undefined;
+      if (existing?.name) continue;
+
+      const { text, userTurns } = buildConversationFromEntries(entries);
+      if (userTurns < minTurns || text.trim().length < 50) continue;
+
+      candidates.push({ filePath, sessionId, cwd: sessionCwd, timestamp: sessionTimestamp, conversationText: text, userTurnCount: userTurns });
     }
   }
 
-  // Sort oldest → newest so insertion order reflects chronological history
-  parsed.sort((a, b) => a.sessionTimestamp - b.sessionTimestamp);
+  candidates.sort((a, b) => a.timestamp - b.timestamp);
+  return candidates;
+}
 
-  for (const { filePath, sessionId, sessionCwd, sessionTimestamp, name } of parsed) {
-    const dashIdx = name.indexOf(" - ");
-    const mainTopic = dashIdx !== -1 ? name.slice(0, dashIdx) : name;
-    const subTopic = dashIdx !== -1 ? name.slice(dashIdx + 3) : null;
+/**
+ * Append a session_info entry to an existing JSONL session file so that
+ * pi's /resume list shows the name instead of the first prompt.
+ */
+export async function appendSessionInfoToJSONL(
+  filePath: string,
+  name: string,
+): Promise<void> {
+  const content = fs.readFileSync(filePath, "utf8");
+  const lines = content.trim().split("\n").filter((l) => l.trim());
 
-    // Ensure the row exists (no-op if already present with a name)
-    db.prepare(
-      `INSERT OR IGNORE INTO sessions (id, cwd, session_file, name, main_topic, sub_topic, embedding, timestamp, named_at)
-       VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?)`,
-    ).run(sessionId, sessionCwd, filePath, name, mainTopic, subTopic, sessionTimestamp, sessionTimestamp);
-
-    // If the row existed but had no name yet (registered but not yet named),
-    // fill in the name from the JSONL — backfill without an embedding.
-    db.prepare(
-      `UPDATE sessions SET name = ?, main_topic = ?, sub_topic = ?, named_at = ?
-       WHERE id = ? AND name IS NULL`,
-    ).run(name, mainTopic, subTopic, sessionTimestamp, sessionId);
+  // Find the last entry with an id to use as parentId
+  let lastId: string | null = null;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    try {
+      const entry = JSON.parse(lines[i]);
+      if (entry.id) { lastId = entry.id; break; }
+    } catch { continue; }
   }
+
+  const newEntry = {
+    type: "session_info",
+    id: randomBytes(4).toString("hex"),
+    parentId: lastId,
+    timestamp: new Date().toISOString(),
+    name,
+  };
+
+  fs.appendFileSync(filePath, JSON.stringify(newEntry) + "\n");
 }
 
 // ---------------------------------------------------------------------------
