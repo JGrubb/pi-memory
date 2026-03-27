@@ -52,7 +52,7 @@ export async function buildSessionContext(
       }
 
       if (session.filesTouched.length > 0) {
-        const files = session.filesTouched.slice(0, 10).map(shortenFile).join(", ");
+        const files = session.filesTouched.slice(0, 10).map((f) => relativeFile(f, session.cwd)).join(", ");
         parts.push(`*Files: ${files}*`);
       }
 
@@ -148,8 +148,12 @@ function shortenPath(fullPath: string): string {
   return parts.slice(-2).join("/");
 }
 
-/** Shorten a file path to just its filename (basename). */
-function shortenFile(filePath: string): string {
+/** Return a file path relative to the project root (cwd), falling back to basename. */
+function relativeFile(filePath: string, cwd: string): string {
+  const root = cwd.endsWith("/") ? cwd : cwd + "/";
+  if (filePath.startsWith(root)) {
+    return filePath.slice(root.length);
+  }
   return filePath.split("/").pop() ?? filePath;
 }
 
