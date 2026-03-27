@@ -8,7 +8,7 @@ import * as path from "node:path";
 import { initDb, insertMemory, searchByVector, getStats, getPendingRecords, updateMemoryAfterRetry, upsertSession, updateSessionName, findSimilarSessions, getBackfillCandidates, appendSessionInfoToJSONL, getSessionMemoriesForSummary, updateSessionDescription } from "./db.js";
 import { embedText, summarizeInteraction, nameSession, summarizeSession } from "./vertex.js";
 import { buildSessionContext, formatSearchResults } from "./context.js";
-import type { Config, MemoryRecord, ExtractedContent } from "./types.js";
+import type { Config, MemoryRecord, ExtractedContent, Resource, ResourceType } from "./types.js";
 
 // ---------------------------------------------------------------------------
 // Config — set via env vars. GOOGLE_CLOUD_PROJECT is required.
@@ -65,10 +65,76 @@ function extractTextParts(content: unknown): string[] {
     .map((p: any) => p.text);
 }
 
+// ---------------------------------------------------------------------------
+// Resource detection helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Infer a Resource from a tool name + its arguments. Returns null if the tool
+ * call doesn't reference a remote resource we care about.
+ */
+function detectResource(toolName: string, args: Record<string, any>): Resource | null {
+  switch (toolName) {
+    case "fetch":
+    case "web_search": {
+      const url: string = args.url ?? args.query ?? "";
+      if (!url) return null;
+      return { type: "url", uri: url };
+    }
+
+    case "grafana_query":
+    case "grafana_query_range": {
+      const query: string = args.query ?? "";
+      const label = query.length > 60 ? query.slice(0, 60) + "…" : query;
+      return { type: "grafana", uri: `grafana:${query}`, label };
+    }
+
+    case "bash": {
+      const cmd: string = args.command ?? "";
+      // BigQuery CLI — match table refs like project.dataset.table
+      const bqMatch = cmd.match(/\bbq\b/);
+      if (bqMatch) {
+        // Extract all fully-qualified table references
+        const tableRefs = [...cmd.matchAll(/`?([a-z0-9_-]+\.[a-z0-9_-]+\.[a-z0-9_-]+)`?/gi)];
+        if (tableRefs.length > 0) {
+          // Return the first one; caller can handle multiples via repeated detection
+          return { type: "bigquery", uri: tableRefs[0][1] };
+        }
+      }
+      return null;
+    }
+
+    default:
+      return null;
+  }
+}
+
+/**
+ * Detect resources from tool name + args, returning potentially multiple
+ * (e.g. a bash bq command with several table refs).
+ */
+function detectResources(toolName: string, args: Record<string, any>): Resource[] {
+  // Special case: bash bq commands may touch multiple tables
+  if (toolName === "bash") {
+    const cmd: string = args.command ?? "";
+    if (/\bbq\b/.test(cmd)) {
+      const tableRefs = [...cmd.matchAll(/`?([a-z0-9_-]+\.[a-z0-9_-]+\.[a-z0-9_-]+)`?/gi)];
+      if (tableRefs.length > 0) {
+        return tableRefs.map((m) => ({ type: "bigquery" as ResourceType, uri: m[1] }));
+      }
+    }
+    return [];
+  }
+
+  const single = detectResource(toolName, args);
+  return single ? [single] : [];
+}
+
 function extractFromMessages(messages: any[]): ExtractedContent {
   let userPrompt = "";
   let assistantResponse = "";
   const filesTouched = new Set<string>();
+  const resourceMap = new Map<string, Resource>(); // keyed by uri for dedup
   const toolsUsed = new Set<string>();
 
   for (const msg of messages) {
@@ -88,6 +154,10 @@ function extractFromMessages(messages: any[]): ExtractedContent {
             toolsUsed.add(part.name);
             const args = part.arguments ?? part.input ?? {};
             if (args.path) filesTouched.add(args.path);
+            // Detect remote resources
+            for (const res of detectResources(part.name, args)) {
+              resourceMap.set(res.uri, res);
+            }
           }
         }
       }
@@ -100,6 +170,7 @@ function extractFromMessages(messages: any[]): ExtractedContent {
     userPrompt,
     assistantResponse: assistantResponse.trim().slice(0, 2000),
     filesTouched: Array.from(filesTouched),
+    resources: Array.from(resourceMap.values()),
     toolsUsed: Array.from(toolsUsed),
   };
 }
@@ -188,6 +259,7 @@ async function processAndStore(
     summary,
     topics,
     filesTouched: extracted.filesTouched,
+    resources: extracted.resources,
     toolsUsed: extracted.toolsUsed,
     userPrompt: extracted.userPrompt.slice(0, 500),
     responseSnippet: extracted.assistantResponse.slice(0, 500),
@@ -241,11 +313,11 @@ async function retryPendingRecords(): Promise<void> {
  * Called at session start/switch so it runs once per new session.
  */
 async function summarizePreviousSession(previousSessionId: string): Promise<void> {
-  const { summaries, filesTouched } = await getSessionMemoriesForSummary(CONFIG.dbPath, previousSessionId);
+  const { summaries, filesTouched, resources } = await getSessionMemoriesForSummary(CONFIG.dbPath, previousSessionId);
   if (summaries.length === 0) return;
 
   const description = await summarizeSession(summaries, CONFIG);
-  await updateSessionDescription(CONFIG.dbPath, previousSessionId, description, filesTouched);
+  await updateSessionDescription(CONFIG.dbPath, previousSessionId, description, filesTouched, resources);
   console.log(`[memory] Summarized previous session (${summaries.length} memories)`);
 }
 
@@ -299,6 +371,7 @@ async function performSessionNaming(
   messages: any[],
   cwd: string,
   sessionId: string,
+  setSessionName: (name: string) => void,
 ): Promise<void> {
   const conversationText = buildConversationText(messages);
   if (conversationText.trim().length < 50) return;
@@ -328,7 +401,7 @@ async function performSessionNaming(
 
   // Step 5: Persist to sessions table and set the pi session name
   await updateSessionName(CONFIG.dbPath, sessionId, mainTopic, subTopic, name, embedding);
-  pi.setSessionName(name);
+  setSessionName(name);
 }
 
 // ---------------------------------------------------------------------------
@@ -516,7 +589,7 @@ export default function (pi: ExtensionAPI) {
       const snapshot = [...conversationBuffer];
       const sessionIdSnapshot = sessionId;
 
-      const namingPromise = performSessionNaming(snapshot, cwd, sessionIdSnapshot).catch((err) =>
+      const namingPromise = performSessionNaming(snapshot, cwd, sessionIdSnapshot, (name) => pi.setSessionName(name)).catch((err) =>
         console.error("[memory] Session naming failed:", err),
       );
       pendingStores.add(namingPromise);
@@ -636,6 +709,7 @@ export default function (pi: ExtensionAPI) {
         summary: params.summary,
         topics: params.topics ?? [],
         filesTouched: [],
+        resources: [],
         toolsUsed: [],
         userPrompt: "",
         responseSnippet: "",
@@ -650,6 +724,89 @@ export default function (pi: ExtensionAPI) {
       return {
         content: [{ type: "text", text: `Artifact saved: "${params.summary}"` }],
         details: { id: record.id },
+      };
+    },
+  });
+
+  // -------------------------------------------------------------------------
+  // Tool: pin_resource
+  // -------------------------------------------------------------------------
+
+  pi.registerTool({
+    name: "pin_resource",
+    label: "Pin Resource",
+    description:
+      "Explicitly pin a remote resource (URL, Jira issue, Confluence page, BigQuery table, Grafana query, etc.) to the current session scope so it appears in future session context alongside files in scope.",
+    promptSnippet: "Pin a remote resource to the current session scope",
+    promptGuidelines: [
+      "Use pin_resource when the user asks to 'remember this page', 'keep track of this issue', or 'add this to scope'.",
+      "Use it for resources that are semantically important to the session but weren't auto-detected from tool calls.",
+      "The uri should be canonical: a full URL, a Jira key like INFRA-1234, a BQ table like project.dataset.table, etc.",
+    ],
+    parameters: Type.Object({
+      uri: Type.String({ description: "Canonical identifier: full URL, Jira key, BQ table name, etc." }),
+      type: Type.Union(
+        [
+          Type.Literal("url"),
+          Type.Literal("confluence"),
+          Type.Literal("jira"),
+          Type.Literal("metabase"),
+          Type.Literal("grafana"),
+          Type.Literal("bigquery"),
+          Type.Literal("other"),
+        ],
+        { description: "Resource type" },
+      ),
+      label: Type.Optional(
+        Type.String({ description: "Human-readable title, e.g. 'INFRA-1234: Fix provisioner bug'" }),
+      ),
+    }),
+
+    async execute(_toolCallId, params, _signal) {
+      if (!dbReady) throw new Error("Memory database not initialized");
+      if (!currentSessionId) throw new Error("No active session");
+
+      const resource: Resource = {
+        type: params.type as ResourceType,
+        uri: params.uri,
+        ...(params.label ? { label: params.label } : {}),
+      };
+
+      // Store as a lightweight memory record with no conversation content,
+      // just so the resource is associated with this session.
+      const display = params.label ? `${params.label} (${params.uri})` : params.uri;
+      const summaryText = `Pinned resource: ${display}`;
+
+      let embedding: Float32Array;
+      try {
+        embedding = await embedText(summaryText, CONFIG, "RETRIEVAL_DOCUMENT");
+      } catch {
+        embedding = new Float32Array(CONFIG.embeddingDims);
+      }
+
+      const record: MemoryRecord = {
+        id: randomUUID(),
+        sessionId: currentSessionId,
+        timestamp: Date.now(),
+        cwd: currentCwd ?? "",
+        summary: summaryText,
+        topics: [params.type],
+        filesTouched: [],
+        resources: [resource],
+        toolsUsed: [],
+        userPrompt: "",
+        responseSnippet: "",
+        status: "complete",
+        rawText: "",
+        type: "memory",
+        content: null,
+      };
+
+      await insertMemory(CONFIG.dbPath, record, embedding);
+
+      return {
+        content: [{ type: "text", text: `Pinned: ${display}` }],
+        details: { uri: params.uri, type: params.type },
       };
     },
   });

@@ -3,7 +3,7 @@ import * as sqliteVec from "sqlite-vec";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { randomBytes } from "node:crypto";
-import type { MemoryRecord, MemoryStatus, MemoryType, SearchResult, SessionRecord } from "./types.js";
+import type { MemoryRecord, MemoryStatus, MemoryType, Resource, SearchResult, SessionRecord } from "./types.js";
 
 // ---------------------------------------------------------------------------
 // Schema
@@ -19,6 +19,7 @@ CREATE TABLE IF NOT EXISTS memories (
     summary         TEXT NOT NULL,
     topics          TEXT,
     files_touched   TEXT,
+    resources       TEXT,
     tools_used      TEXT,
     user_prompt     TEXT,
     response_snippet TEXT,
@@ -41,6 +42,7 @@ const MIGRATIONS = [
   `CREATE INDEX IF NOT EXISTS idx_memories_status ON memories(status)`,
   `ALTER TABLE memories ADD COLUMN type TEXT NOT NULL DEFAULT 'memory'`,
   `ALTER TABLE memories ADD COLUMN content TEXT`,
+  `ALTER TABLE memories ADD COLUMN resources TEXT`,
 ];
 
 const SESSIONS_TABLE = `
@@ -53,6 +55,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     sub_topic    TEXT,
     description  TEXT,
     files_touched TEXT NOT NULL DEFAULT '[]',
+    resources    TEXT NOT NULL DEFAULT '[]',
     embedding    BLOB,
     timestamp    INTEGER NOT NULL,
     named_at     INTEGER
@@ -69,6 +72,7 @@ CREATE INDEX IF NOT EXISTS idx_sessions_ts ON sessions(timestamp DESC);
 const SESSIONS_MIGRATIONS = [
   `ALTER TABLE sessions ADD COLUMN description TEXT`,
   `ALTER TABLE sessions ADD COLUMN files_touched TEXT NOT NULL DEFAULT '[]'`,
+  `ALTER TABLE sessions ADD COLUMN resources TEXT NOT NULL DEFAULT '[]'`,
 ];
 
 // vec0 virtual table — cosine distance, with cwd as a metadata column for
@@ -159,6 +163,24 @@ export async function initDb(dbPath: string): Promise<void> {
       }
     }
   }
+
+  // One-time data fix: older versions stored the full .jsonl file path as
+  // session_id in memories (before commit a74db4b switched to UUID).
+  // Normalize them by extracting the UUID from the filename suffix.
+  const legacyCount = (db.prepare(
+    `SELECT COUNT(*) as n FROM memories WHERE session_id LIKE '%.jsonl'`,
+  ).get() as { n: number }).n;
+  if (legacyCount > 0) {
+    db.prepare(
+      `UPDATE memories
+       SET session_id = REPLACE(
+         substr(session_id, instr(session_id, '_') + 1),
+         '.jsonl', ''
+       )
+       WHERE session_id LIKE '%.jsonl'`,
+    ).run();
+    console.log(`[memory] Migrated ${legacyCount} legacy session_id(s) from file path to UUID`);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -175,12 +197,13 @@ export async function insertMemory(
     // Upsert into memories table
     db.prepare(
       `INSERT INTO memories
-       (id, session_id, timestamp, cwd, summary, topics, files_touched, tools_used, user_prompt, response_snippet, status, raw_text, type, content)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       (id, session_id, timestamp, cwd, summary, topics, files_touched, resources, tools_used, user_prompt, response_snippet, status, raw_text, type, content)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(id) DO UPDATE SET
          summary = excluded.summary,
          topics = excluded.topics,
          files_touched = excluded.files_touched,
+         resources = excluded.resources,
          tools_used = excluded.tools_used,
          user_prompt = excluded.user_prompt,
          response_snippet = excluded.response_snippet,
@@ -196,6 +219,7 @@ export async function insertMemory(
       record.summary,
       JSON.stringify(record.topics),
       JSON.stringify(record.filesTouched),
+      JSON.stringify(record.resources),
       JSON.stringify(record.toolsUsed),
       record.userPrompt,
       record.responseSnippet,
@@ -280,7 +304,7 @@ export async function searchByVector(
   const placeholders = knnRows.map(() => "?").join(",");
   const memRows = db
     .prepare(
-      `SELECT rowid, id, summary, cwd, timestamp, topics, files_touched, user_prompt, type, content
+      `SELECT rowid, id, summary, cwd, timestamp, topics, files_touched, resources, user_prompt, type, content
        FROM memories
        WHERE rowid IN (${placeholders})`,
     )
@@ -302,6 +326,7 @@ export async function searchByVector(
         timestamp: m.timestamp,
         topics: safeJsonParse(m.topics, []),
         filesTouched: safeJsonParse(m.files_touched, []),
+        resources: safeJsonParse(m.resources, []),
         userPrompt: m.user_prompt ?? "",
         distance: kr.distance,
         type: (m.type ?? "memory") as MemoryType,
@@ -326,7 +351,7 @@ export async function getRecentForCwd(
 
   if (excludeSessionId) {
     sql = `
-      SELECT id, session_id, summary, cwd, timestamp, topics, files_touched, user_prompt, type, content
+      SELECT id, session_id, summary, cwd, timestamp, topics, files_touched, resources, user_prompt, type, content
       FROM memories
       WHERE cwd = ? AND (session_id IS NULL OR session_id != ?) AND type = 'memory'
       ORDER BY timestamp DESC
@@ -335,7 +360,7 @@ export async function getRecentForCwd(
     args.push(excludeSessionId, limit);
   } else {
     sql = `
-      SELECT id, session_id, summary, cwd, timestamp, topics, files_touched, user_prompt, type, content
+      SELECT id, session_id, summary, cwd, timestamp, topics, files_touched, resources, user_prompt, type, content
       FROM memories
       WHERE cwd = ? AND type = 'memory'
       ORDER BY timestamp DESC
@@ -354,6 +379,7 @@ export async function getRecentForCwd(
     timestamp: r.timestamp,
     topics: safeJsonParse(r.topics, []),
     filesTouched: safeJsonParse(r.files_touched, []),
+    resources: safeJsonParse(r.resources, []),
     userPrompt: r.user_prompt ?? "",
     distance: 0,
     type: "memory" as MemoryType,
@@ -391,6 +417,7 @@ export async function getRecentCrossProject(
     timestamp: r.timestamp,
     topics: safeJsonParse(r.topics, []),
     filesTouched: safeJsonParse(r.files_touched, []),
+    resources: safeJsonParse(r.resources, []),
     userPrompt: r.user_prompt ?? "",
     distance: 0,
     type: "memory" as MemoryType,
@@ -528,11 +555,11 @@ export async function updateSessionName(
 export async function getSessionMemoriesForSummary(
   dbPath: string,
   sessionId: string,
-): Promise<{ summaries: string[]; filesTouched: string[] }> {
+): Promise<{ summaries: string[]; filesTouched: string[]; resources: Resource[] }> {
   const db = getDb(dbPath);
   const rows = db
     .prepare(
-      `SELECT summary, files_touched FROM memories
+      `SELECT summary, files_touched, resources FROM memories
        WHERE session_id = ? AND type = 'memory'
        ORDER BY timestamp ASC`,
     )
@@ -540,11 +567,15 @@ export async function getSessionMemoriesForSummary(
 
   const summaries: string[] = rows.map((r) => r.summary);
   const allFiles = new Set<string>();
+  const allResources = new Map<string, Resource>(); // keyed by uri for dedup
   for (const r of rows) {
     for (const f of safeJsonParse(r.files_touched, [])) allFiles.add(f);
+    for (const res of safeJsonParse<Resource[]>(r.resources, [])) {
+      allResources.set(res.uri, res);
+    }
   }
 
-  return { summaries, filesTouched: Array.from(allFiles) };
+  return { summaries, filesTouched: Array.from(allFiles), resources: Array.from(allResources.values()) };
 }
 
 /**
@@ -555,15 +586,18 @@ export async function updateSessionDescription(
   sessionId: string,
   description: string,
   filesTouched: string[],
+  resources: Resource[],
 ): Promise<void> {
   const db = getDb(dbPath);
   db.prepare(
-    `UPDATE sessions SET description = ?, files_touched = ? WHERE id = ?`,
-  ).run(description, JSON.stringify(filesTouched), sessionId);
+    `UPDATE sessions SET description = ?, files_touched = ?, resources = ? WHERE id = ?`,
+  ).run(description, JSON.stringify(filesTouched), JSON.stringify(resources), sessionId);
 }
 
 /**
  * Return recent named sessions for a given cwd, excluding the current session.
+ * If a session's files_touched is empty (not yet summarized), falls back to
+ * aggregating files from individual memory records for that session.
  */
 export async function getRecentSessions(
   dbPath: string,
@@ -574,7 +608,7 @@ export async function getRecentSessions(
   const db = getDb(dbPath);
   const rows = db
     .prepare(
-      `SELECT id, cwd, session_file, name, main_topic, sub_topic, description, files_touched, timestamp, named_at
+      `SELECT id, cwd, session_file, name, main_topic, sub_topic, description, files_touched, resources, timestamp, named_at
        FROM sessions
        WHERE cwd = ? AND id != ? AND name IS NOT NULL
        ORDER BY timestamp DESC
@@ -582,18 +616,43 @@ export async function getRecentSessions(
     )
     .all(cwd, excludeId, limit) as any[];
 
-  return rows.map((r) => ({
-    id: r.id,
-    cwd: r.cwd,
-    sessionFile: r.session_file ?? null,
-    name: r.name,
-    mainTopic: r.main_topic ?? null,
-    subTopic: r.sub_topic ?? null,
-    description: r.description ?? null,
-    filesTouched: safeJsonParse(r.files_touched, []),
-    timestamp: r.timestamp,
-    namedAt: r.named_at ?? null,
-  }));
+  return rows.map((r) => {
+    let filesTouched: string[] = safeJsonParse(r.files_touched, []);
+    let resources: Resource[] = safeJsonParse(r.resources, []);
+
+    // If the session hasn't been summarized yet, aggregate files+resources from memories
+    if (filesTouched.length === 0 && resources.length === 0) {
+      const memRows = db
+        .prepare(
+          `SELECT files_touched, resources FROM memories WHERE session_id = ? AND type = 'memory'`,
+        )
+        .all(r.id) as any[];
+      const allFiles = new Set<string>();
+      const allResources = new Map<string, Resource>();
+      for (const m of memRows) {
+        for (const f of safeJsonParse(m.files_touched, [])) allFiles.add(f);
+        for (const res of safeJsonParse<Resource[]>(m.resources, [])) {
+          allResources.set(res.uri, res);
+        }
+      }
+      filesTouched = Array.from(allFiles);
+      resources = Array.from(allResources.values());
+    }
+
+    return {
+      id: r.id,
+      cwd: r.cwd,
+      sessionFile: r.session_file ?? null,
+      name: r.name,
+      mainTopic: r.main_topic ?? null,
+      subTopic: r.sub_topic ?? null,
+      description: r.description ?? null,
+      filesTouched,
+      resources,
+      timestamp: r.timestamp,
+      namedAt: r.named_at ?? null,
+    };
+  });
 }
 
 /**
@@ -608,7 +667,7 @@ export async function getRecentSessionsCrossProject(
   const db = getDb(dbPath);
   const rows = db
     .prepare(
-      `SELECT s.id, s.cwd, s.session_file, s.name, s.main_topic, s.sub_topic, s.description, s.files_touched, s.timestamp, s.named_at
+      `SELECT s.id, s.cwd, s.session_file, s.name, s.main_topic, s.sub_topic, s.description, s.files_touched, s.resources, s.timestamp, s.named_at
        FROM sessions s
        INNER JOIN (
          SELECT cwd, MAX(timestamp) as max_ts
@@ -630,6 +689,7 @@ export async function getRecentSessionsCrossProject(
     subTopic: r.sub_topic ?? null,
     description: r.description ?? null,
     filesTouched: safeJsonParse(r.files_touched, []),
+    resources: safeJsonParse(r.resources, []),
     timestamp: r.timestamp,
     namedAt: r.named_at ?? null,
   }));
@@ -674,6 +734,7 @@ export async function findSimilarSessions(
     subTopic: r.sub_topic ?? null,
     description: null,
     filesTouched: [],
+    resources: [],
     timestamp: r.timestamp,
     namedAt: r.named_at ?? null,
   }));

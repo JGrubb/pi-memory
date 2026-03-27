@@ -1,5 +1,5 @@
 import { getRecentSessions, getRecentSessionsCrossProject } from "./db.js";
-import type { SearchResult, SessionRecord } from "./types.js";
+import type { Resource, SearchResult, SessionRecord } from "./types.js";
 
 /**
  * Build the context string injected at the start of a new coding session.
@@ -52,8 +52,13 @@ export async function buildSessionContext(
       }
 
       if (session.filesTouched.length > 0) {
-        const files = session.filesTouched.slice(0, 8).join(", ");
+        const files = session.filesTouched.slice(0, 10).map(shortenFile).join(", ");
         parts.push(`*Files: ${files}*`);
+      }
+
+      if (session.resources.length > 0) {
+        const res = session.resources.slice(0, 8).map(formatResource).join(", ");
+        parts.push(`*Resources: ${res}*`);
       }
     }
   }
@@ -98,6 +103,9 @@ export function formatSearchResults(results: SearchResult[]): string {
     if (r.filesTouched.length > 0) {
       lines.push(`  Files: ${r.filesTouched.slice(0, 5).join(", ")}`);
     }
+    if (r.resources && r.resources.length > 0) {
+      lines.push(`  Resources: ${r.resources.slice(0, 5).map(formatResource).join(", ")}`);
+    }
     lines.push("");
   }
   return lines.join("\n");
@@ -107,10 +115,42 @@ export function formatSearchResults(results: SearchResult[]): string {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/** Format a Resource for compact display in context. */
+function formatResource(r: Resource): string {
+  if (r.label) return r.label;
+  switch (r.type) {
+    case "url": {
+      // Show hostname + first path segment
+      try {
+        const u = new URL(r.uri);
+        const seg = u.pathname.split("/").filter(Boolean)[0];
+        return seg ? `${u.hostname}/${seg}` : u.hostname;
+      } catch {
+        return r.uri.slice(0, 60);
+      }
+    }
+    case "jira":
+    case "confluence":
+    case "metabase":
+    case "bigquery":
+      return r.uri;
+    case "grafana":
+      // Strip the "grafana:" prefix stored on auto-detected queries
+      return r.uri.startsWith("grafana:") ? r.uri.slice(8, 60) + (r.uri.length > 68 ? "…" : "") : r.uri.slice(0, 60);
+    default:
+      return r.uri.slice(0, 60);
+  }
+}
+
 function shortenPath(fullPath: string): string {
   const parts = fullPath.split("/").filter(Boolean);
   if (parts.length <= 2) return fullPath;
   return parts.slice(-2).join("/");
+}
+
+/** Shorten a file path to just its filename (basename). */
+function shortenFile(filePath: string): string {
+  return filePath.split("/").pop() ?? filePath;
 }
 
 function formatDate(timestamp: number): string {

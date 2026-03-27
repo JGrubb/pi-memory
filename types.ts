@@ -1,6 +1,14 @@
 export type MemoryStatus = "complete" | "pending" | "pending_embed";
 export type MemoryType = "memory" | "artifact";
 
+export type ResourceType = "url" | "confluence" | "jira" | "metabase" | "grafana" | "bigquery" | "other";
+
+export interface Resource {
+  type: ResourceType;
+  uri: string;    // canonical identifier — URL, issue key, card ID, table name, etc.
+  label?: string; // human-readable title, e.g. "INFRA-1234: Fix provisioner"
+}
+
 export interface MemoryRecord {
   id: string;
   sessionId: string;
@@ -9,6 +17,7 @@ export interface MemoryRecord {
   summary: string;
   topics: string[];
   filesTouched: string[];
+  resources: Resource[];
   toolsUsed: string[];
   userPrompt: string;
   responseSnippet: string;
@@ -26,6 +35,7 @@ export interface SearchResult {
   timestamp: number;
   topics: string[];
   filesTouched: string[];
+  resources: Resource[];
   userPrompt: string;
   distance: number;
   type: MemoryType;
@@ -41,6 +51,7 @@ export interface SessionRecord {
   subTopic: string | null;
   description: string | null;
   filesTouched: string[];
+  resources: Resource[];
   timestamp: number;
   namedAt: number | null;
 }
@@ -49,6 +60,7 @@ export interface ExtractedContent {
   userPrompt: string;
   assistantResponse: string;
   filesTouched: string[];
+  resources: Resource[];
   toolsUsed: string[];
 }
 

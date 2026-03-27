@@ -29,6 +29,7 @@ function makeRecord(overrides: Partial<MemoryRecord> = {}): MemoryRecord {
     summary: "Refactored billing pipeline",
     topics: ["dbt", "bigquery"],
     filesTouched: ["models/billing.sql"],
+    resources: [],
     toolsUsed: ["read", "edit"],
     userPrompt: "Refactor billing",
     responseSnippet: "Done.",
@@ -72,7 +73,7 @@ describe("buildSessionContext", () => {
 
     await upsertSession(dbPath, makeSessionRecord({ id: "s1", cwd: "/my/project" }));
     await updateSessionName(dbPath, "s1", "Auth", "middleware fix", "Auth - middleware fix", makeSessionEmbedding());
-    await updateSessionDescription(dbPath, "s1", "Fixed the auth middleware to handle token expiry correctly.", ["/my/project/src/auth.ts"]);
+    await updateSessionDescription(dbPath, "s1", "Fixed the auth middleware to handle token expiry correctly.", ["/my/project/src/auth.ts"], []);
 
     const ctx = await buildSessionContext(dbPath, "/my/project", "current-session");
     assert.ok(ctx !== null);
@@ -126,7 +127,7 @@ describe("buildSessionContext", () => {
 
     await upsertSession(dbPath, makeSessionRecord({ id: "same", cwd: "/my/project" }));
     await updateSessionName(dbPath, "same", "DBT", "model updates", "DBT - model updates", makeSessionEmbedding());
-    await updateSessionDescription(dbPath, "same", "Updated dbt models for billing pipeline.", []);
+    await updateSessionDescription(dbPath, "same", "Updated dbt models for billing pipeline.", [], []);
 
     await upsertSession(dbPath, makeSessionRecord({ id: "cross", cwd: "/other/project" }));
     await updateSessionName(dbPath, "cross", "CI Pipeline", "fix flaky tests", "CI Pipeline - fix flaky tests", makeSessionEmbedding());
@@ -155,8 +156,11 @@ describe("formatSearchResults", () => {
         timestamp: Date.now() - 86400000, // yesterday
         topics: ["dbt", "billing"],
         filesTouched: ["models/billing.sql"],
+        resources: [],
         userPrompt: "migrate billing",
         distance: 0.15, // 85% similar
+        type: "memory",
+        content: null,
       },
     ];
 
@@ -178,8 +182,11 @@ describe("formatSearchResults", () => {
         timestamp: Date.now(),
         topics: [],
         filesTouched: [],
+        resources: [],
         userPrompt: "do stuff",
         distance: 0.3,
+        type: "memory",
+        content: null,
       },
     ];
 
@@ -203,6 +210,7 @@ function makeSessionRecord(overrides: Partial<SessionRecord> = {}): SessionRecor
     subTopic: null,
     description: null,
     filesTouched: [],
+    resources: [],
     timestamp: Date.now(),
     namedAt: null,
     ...overrides,
@@ -230,6 +238,7 @@ describe("buildSessionContext — session chapter headings", () => {
     await updateSessionDescription(dbPath, "old-session",
       "Rewrote the export query and added partition pruning to fix billing cost export.",
       ["/my/project/models/billing.sql"],
+      [],
     );
 
     const ctx = await buildSessionContext(dbPath, "/my/project", "current-session");
@@ -299,7 +308,7 @@ describe("buildSessionContext — files in scope", () => {
     await updateSessionDescription(dbPath, "s1", "Updated the billing module.", [
       "/my/project/src/billing.ts",
       "/my/project/tests/billing.test.ts",
-    ]);
+    ], []);
 
     const ctx = await buildSessionContext(dbPath, "/my/project", "current");
     assert.ok(ctx !== null);
@@ -311,7 +320,7 @@ describe("buildSessionContext — files in scope", () => {
 
     await upsertSession(dbPath, makeSessionRecord({ id: "s1", cwd: "/my/project" }));
     await updateSessionName(dbPath, "s1", "Research", "exploration", "Research - exploration", makeSessionEmbedding());
-    await updateSessionDescription(dbPath, "s1", "Did some exploratory research.", []);
+    await updateSessionDescription(dbPath, "s1", "Did some exploratory research.", [], []);
 
     const ctx = await buildSessionContext(dbPath, "/my/project", "current");
     assert.ok(ctx !== null);

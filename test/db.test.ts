@@ -38,6 +38,7 @@ function makeRecord(overrides: Partial<MemoryRecord> = {}): MemoryRecord {
     summary: "Refactored the billing pipeline to use hourly grain",
     topics: ["dbt", "bigquery", "refactor"],
     filesTouched: ["models/billing.sql", "tests/test_billing.sql"],
+    resources: [],
     toolsUsed: ["read", "edit", "bash"],
     userPrompt: "Refactor the billing model to hourly grain",
     responseSnippet: "I've updated the billing model...",
