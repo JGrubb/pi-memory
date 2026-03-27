@@ -22,7 +22,7 @@ This means the agent can answer questions like *"did we already add auth to this
 - **Project-aware context**: scopes recent history to the current working directory, plus cross-project highlights
 - **Persistent storage**: local SQLite file, no external services required for storage
 - **Multi-session safe**: WAL mode + `better-sqlite3` allows concurrent access from multiple pi sessions
-- **Hybrid AI backend**: embeddings via Vertex AI (Gemini); summarization via Anthropic API directly (Claude Haiku) — avoiding Vertex quota limits on Anthropic-hosted models
+- **Flexible AI backend**: embeddings via Vertex AI (Gemini) or a local Ollama model; summarization via Claude on Vertex, Gemini on Vertex, or Anthropic direct API
 - **`memory_search` tool**: available in agent prompts for on-demand semantic search
 
 ## Installation
@@ -38,46 +38,73 @@ npm install
 
 ## Configuration
 
-Set the following environment variables (e.g. in your shell profile):
+Two concerns are configured independently: **embedding** (where vectors are computed) and **summarization** (which LLM processes conversation text). Each has its own provider setting.
 
-| Variable | Required | Default | Description |
-|----------|----------|---------|-------------|
-| `GOOGLE_CLOUD_PROJECT` | **Yes** | — | GCP project with Vertex AI API enabled |
-| `PI_MEMORY_REGION` | No | `global` | Vertex AI region for embeddings. **Note:** if using a Claude summarization model via Vertex, set this to a region that supports Anthropic models (e.g. `us-east5`) — `global` will not work for Claude on Vertex. |
-| `PI_MEMORY_SUMMARIZE_MODEL` | No | `claude-haiku-4-5@20251001` | Summarization model name |
-| `PI_MEMORY_SUMMARIZE_PROVIDER` | No | `vertex` | Summarization provider: `vertex` (uses GCP ADC, no extra key needed) or `anthropic` (requires `ANTHROPIC_API_KEY`) |
-| `ANTHROPIC_API_KEY` | No | — | Only required when `PI_MEMORY_SUMMARIZE_PROVIDER=anthropic` |
-| `PI_MEMORY_EMBED_MODEL` | No | `gemini-embedding-001` | Embedding model (always Vertex AI) |
-| `PI_MEMORY_EMBED_DIMS` | No | `768` | Embedding dimensions |
-| `PI_MEMORY_DB_PATH` | No | `~/.pi/agent/memory/memory.db` | Database file path |
+### Shared Vertex config
 
-**Recommended setup for GCP-only environments** (no Anthropic API key):
+These env vars are shared with the [claude-vertex](../claude-vertex) provider extension — no duplication needed if you're already using it.
 
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ANTHROPIC_VERTEX_PROJECT_ID` | — | GCP project with Vertex AI enabled (falls back to `GOOGLE_CLOUD_PROJECT`) |
+| `GOOGLE_CLOUD_LOCATION` | `global` | Vertex AI region (falls back to `CLOUD_ML_REGION`) |
+
+### Embedding
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PI_MEMORY_EMBED_PROVIDER` | `vertex` | `vertex` (Gemini via Vertex AI) or `ollama` (local model) |
+| `PI_MEMORY_EMBED_MODEL` | `gemini-embedding-001` | Embedding model name |
+| `PI_MEMORY_EMBED_DIMS` | `768` | Embedding dimensions — must match the model's output |
+| `PI_MEMORY_OLLAMA_URL` | `http://localhost:11434` | Ollama base URL (only used when `embedProvider=ollama`) |
+
+### Summarization
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PI_MEMORY_SUMMARIZE_PROVIDER` | `vertex-anthropic` | `vertex-anthropic`, `vertex-google`, or `anthropic` |
+| `PI_MEMORY_SUMMARIZE_MODEL` | `claude-haiku-4-5@20251001` | Model name appropriate for the chosen provider |
+| `ANTHROPIC_API_KEY` | — | Required only when `summarizeProvider=anthropic` |
+
+### Other
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PI_MEMORY_DB_PATH` | `~/.pi/agent/memory/memory.db` | SQLite database path |
+
+### Common configurations
+
+**Vertex only** — one auth mechanism, no API keys:
 ```sh
-export GOOGLE_CLOUD_PROJECT=my-gcp-project
-export PI_MEMORY_SUMMARIZE_PROVIDER=vertex
-export PI_MEMORY_SUMMARIZE_MODEL=claude-haiku-4-5@20251001
-export PI_MEMORY_REGION=us-east5   # required for Claude on Vertex
+export ANTHROPIC_VERTEX_PROJECT_ID=my-gcp-project
+# PI_MEMORY_EMBED_PROVIDER=vertex       (default)
+# PI_MEMORY_SUMMARIZE_PROVIDER=vertex-anthropic  (default)
 ```
 
-### GCP Setup (for embeddings)
+**Anthropic direct + Vertex embeddings** — use your Anthropic API key for summarization:
+```sh
+export ANTHROPIC_VERTEX_PROJECT_ID=my-gcp-project
+export ANTHROPIC_API_KEY=sk-ant-...
+export PI_MEMORY_SUMMARIZE_PROVIDER=anthropic
+```
+
+**Fully local** — no GCP required:
+```sh
+export PI_MEMORY_EMBED_PROVIDER=ollama
+export PI_MEMORY_EMBED_MODEL=nomic-embed-text
+export PI_MEMORY_EMBED_DIMS=768
+export ANTHROPIC_API_KEY=sk-ant-...
+export PI_MEMORY_SUMMARIZE_PROVIDER=anthropic
+```
+
+### GCP setup
 
 1. Enable the Vertex AI API in your GCP project
 2. Ensure your account has the `aiplatform.endpoints.predict` permission (e.g. `roles/aiplatform.user`)
-3. Set up Application Default Credentials:
+3. Authenticate with Application Default Credentials:
    ```bash
    gcloud auth application-default login
    ```
-4. Export your project:
-   ```bash
-   export GOOGLE_CLOUD_PROJECT=your-gcp-project-id
-   ```
-
-### Anthropic API Setup (for summarization)
-
-```bash
-export ANTHROPIC_API_KEY=sk-ant-...
-```
 
 ## Usage
 
@@ -116,7 +143,7 @@ Type `/memory` in pi to show memory system stats:
 
 - **index.ts**: Extension entry point — tool/command registration, session lifecycle hooks, message parsing, background storage
 - **db.ts**: SQLite + sqlite-vec database layer with connection caching and KNN search
-- **vertex.ts**: AI integrations — Vertex AI (Gemini embeddings) and Anthropic API (Claude summarization)
+- **vertex.ts**: AI integrations — embedding (Vertex/Ollama) and summarization (Vertex-Anthropic, Vertex-Google, or Anthropic direct) with a shared `callLLM()` dispatcher
 - **context.ts**: Session context builder and search result formatter
 - **types.ts**: TypeScript type definitions
 

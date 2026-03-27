@@ -36,17 +36,11 @@ function getAnthropicApiKey(): string {
 // ---------------------------------------------------------------------------
 
 function vertexUrl(config: Config, publisher: string, model: string, method: string): string {
-  const isGoogle = publisher === "google";
-  // Anthropic models on Vertex require a specific region (not "global").
-  // Fall back to us-east5 if region is left at the default "global".
-  const region =
-    !isGoogle && config.region === "global" ? "us-east5" : config.region;
   const host =
-    region === "global"
+    config.region === "global"
       ? "aiplatform.googleapis.com"
-      : `${region}-aiplatform.googleapis.com`;
-  // For Google models (Gemini), the URL structure is the same but kept explicit
-  return `https://${host}/v1/projects/${config.gcpProject}/locations/${region}/publishers/${publisher}/models/${model}:${method}`;
+      : `${config.region}-aiplatform.googleapis.com`;
+  return `https://${host}/v1/projects/${config.gcpProject}/locations/${config.region}/publishers/${publisher}/models/${model}:${method}`;
 }
 
 async function vertexFetch(url: string, body: object, isEmbed: boolean = false): Promise<any> {
@@ -90,21 +84,80 @@ async function anthropicFetch(body: object): Promise<any> {
 }
 
 // ---------------------------------------------------------------------------
-// Embeddings — Vertex AI gemini-embedding-001
+// Embeddings — Vertex AI (gemini-embedding-001) or Ollama (local)
 // ---------------------------------------------------------------------------
+
+async function embedViaVertex(
+  text: string,
+  config: Config,
+  taskType: "RETRIEVAL_DOCUMENT" | "RETRIEVAL_QUERY",
+): Promise<Float32Array> {
+  const url = vertexUrl(config, "google", config.embedModel, "predict");
+  const data = await vertexFetch(url, {
+    instances: [{ content: text, task_type: taskType }],
+    parameters: { outputDimensionality: config.embedDims },
+  }, true);
+  const values: number[] = data.predictions[0].embeddings.values;
+  return new Float32Array(values);
+}
+
+async function embedViaOllama(text: string, config: Config): Promise<Float32Array> {
+  const res = await fetch(`${config.ollamaUrl}/api/embeddings`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ model: config.embedModel, prompt: text }),
+  });
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`Ollama embeddings ${res.status}: ${body}`);
+  }
+  const data = await res.json();
+  return new Float32Array(data.embedding);
+}
 
 export async function embedText(
   text: string,
   config: Config,
   taskType: "RETRIEVAL_DOCUMENT" | "RETRIEVAL_QUERY" = "RETRIEVAL_DOCUMENT",
 ): Promise<Float32Array> {
-  const url = vertexUrl(config, "google", config.embeddingModel, "predict");
-  const data = await vertexFetch(url, {
-    instances: [{ content: text, task_type: taskType }],
-    parameters: { outputDimensionality: config.embeddingDims },
-  }, true);
-  const values: number[] = data.predictions[0].embeddings.values;
-  return new Float32Array(values);
+  if (config.embedProvider === "ollama") {
+    return embedViaOllama(text, config);
+  }
+  return embedViaVertex(text, config, taskType);
+}
+
+// ---------------------------------------------------------------------------
+// Summarization — shared dispatcher
+// ---------------------------------------------------------------------------
+
+async function callLLM(prompt: string, maxTokens: number, config: Config): Promise<string> {
+  switch (config.summarizeProvider) {
+    case "anthropic": {
+      const data = await anthropicFetch({
+        model: config.summarizeModel,
+        max_tokens: maxTokens,
+        messages: [{ role: "user", content: prompt }],
+      });
+      return data.content[0].text;
+    }
+    case "vertex-anthropic": {
+      const url = vertexUrl(config, "anthropic", config.summarizeModel, "rawPredict");
+      const data = await vertexFetch(url, {
+        anthropic_version: "vertex-2023-10-16",
+        max_tokens: maxTokens,
+        messages: [{ role: "user", content: prompt }],
+      });
+      return data.content[0].text;
+    }
+    case "vertex-google": {
+      const url = vertexUrl(config, "google", config.summarizeModel, "streamGenerateContent");
+      const data = await vertexFetch(url, {
+        contents: [{ role: "user", parts: [{ text: prompt }] }],
+        generationConfig: { maxOutputTokens: maxTokens, temperature: 0.1 },
+      });
+      return data[0].candidates[0].content.parts[0].text;
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -130,32 +183,7 @@ export async function nameSession(
   config: Config,
 ): Promise<{ mainTopic: string; subTopic: string }> {
   const prompt = NAMING_PROMPT.replace("{{CONVERSATION}}", conversationText);
-  let raw: string;
-
-  if (config.summarizeProvider === "anthropic") {
-    const data = await anthropicFetch({
-      model: config.summarizeModel,
-      max_tokens: 128,
-      messages: [{ role: "user", content: prompt }],
-    });
-    raw = data.content[0].text;
-  } else if (config.summarizeModel.startsWith("claude")) {
-    const url = vertexUrl(config, "anthropic", config.summarizeModel, "rawPredict");
-    const data = await vertexFetch(url, {
-      anthropic_version: "vertex-2023-10-16",
-      max_tokens: 128,
-      messages: [{ role: "user", content: prompt }],
-    });
-    raw = data.content[0].text;
-  } else {
-    const url = vertexUrl(config, "google", config.summarizeModel, "streamGenerateContent");
-    const data = await vertexFetch(url, {
-      contents: [{ role: "user", parts: [{ text: prompt }] }],
-      generationConfig: { maxOutputTokens: 128, temperature: 0.1 },
-    });
-    raw = data[0].candidates[0].content.parts[0].text;
-  }
-
+  const raw = await callLLM(prompt, 128, config);
   const text = raw.replace(/^```(?:json)?\s*\n?/i, "").replace(/\n?```\s*$/i, "").trim();
 
   try {
@@ -191,32 +219,7 @@ export async function summarizeSession(
 ): Promise<string> {
   const memoriesText = memorySummaries.map((s, i) => `${i + 1}. ${s}`).join("\n");
   const prompt = SESSION_SUMMARY_PROMPT.replace("{{MEMORIES}}", memoriesText);
-  let raw: string;
-
-  if (config.summarizeProvider === "anthropic") {
-    const data = await anthropicFetch({
-      model: config.summarizeModel,
-      max_tokens: 256,
-      messages: [{ role: "user", content: prompt }],
-    });
-    raw = data.content[0].text;
-  } else if (config.summarizeModel.startsWith("claude")) {
-    const url = vertexUrl(config, "anthropic", config.summarizeModel, "rawPredict");
-    const data = await vertexFetch(url, {
-      anthropic_version: "vertex-2023-10-16",
-      max_tokens: 256,
-      messages: [{ role: "user", content: prompt }],
-    });
-    raw = data.content[0].text;
-  } else {
-    const url = vertexUrl(config, "google", config.summarizeModel, "streamGenerateContent");
-    const data = await vertexFetch(url, {
-      contents: [{ role: "user", parts: [{ text: prompt }] }],
-      generationConfig: { maxOutputTokens: 256, temperature: 0.2 },
-    });
-    raw = data[0].candidates[0].content.parts[0].text;
-  }
-
+  const raw = await callLLM(prompt, 256, config);
   return raw.trim();
 }
 
@@ -239,37 +242,7 @@ export async function summarizeInteraction(
   config: Config,
 ): Promise<{ summary: string; topics: string[] }> {
   const prompt = EXTRACTION_PROMPT.replace("{{CONVERSATION}}", conversationText);
-  let raw: string;
-
-  if (config.summarizeProvider === "anthropic") {
-    // Direct Anthropic API — requires ANTHROPIC_API_KEY
-    const data = await anthropicFetch({
-      model: config.summarizeModel,
-      max_tokens: 512,
-      messages: [{ role: "user", content: prompt }],
-    });
-    raw = data.content[0].text;
-  } else if (config.summarizeModel.startsWith("claude")) {
-    // Claude served through Vertex AI (Anthropic publisher)
-    const url = vertexUrl(config, "anthropic", config.summarizeModel, "rawPredict");
-    const data = await vertexFetch(url, {
-      anthropic_version: "vertex-2023-10-16",
-      max_tokens: 512,
-      messages: [{ role: "user", content: prompt }],
-    });
-    raw = data.content[0].text;
-  } else {
-    // Gemini via Vertex AI
-    const url = vertexUrl(config, "google", config.summarizeModel, "streamGenerateContent");
-    const data = await vertexFetch(url, {
-      contents: [{ role: "user", parts: [{ text: prompt }] }],
-      generationConfig: {
-        maxOutputTokens: 512,
-        temperature: 0.1,
-      },
-    });
-    raw = data[0].candidates[0].content.parts[0].text;
-  }
+  const raw = await callLLM(prompt, 512, config);
 
   // Strip markdown fencing if model wrapped the JSON
   const text = raw.replace(/^```(?:json)?\s*\n?/i, "").replace(/\n?```\s*$/i, "").trim();

@@ -65,11 +65,19 @@ export interface ExtractedContent {
 }
 
 export interface Config {
+  // Shared Vertex config (used when either provider targets Vertex)
   gcpProject: string;
   region: string;
-  embeddingModel: string;
+
+  // Embedding
+  embedProvider: "vertex" | "ollama";
+  embedModel: string;
+  embedDims: number;
+  ollamaUrl: string;
+
+  // Summarization
+  summarizeProvider: "vertex-anthropic" | "vertex-google" | "anthropic";
   summarizeModel: string;
-  summarizeProvider: "vertex" | "anthropic";
-  embeddingDims: number;
+
   dbPath: string;
 }

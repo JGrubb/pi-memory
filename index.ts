@@ -11,27 +11,50 @@ import { buildSessionContext, formatSearchResults } from "./context.js";
 import type { Config, MemoryRecord, ExtractedContent, Resource, ResourceType } from "./types.js";
 
 // ---------------------------------------------------------------------------
-// Config — set via env vars. GOOGLE_CLOUD_PROJECT is required.
+// Config — env vars. GCP vars are shared with the claude-vertex extension.
 //
-//   GOOGLE_CLOUD_PROJECT  — GCP project with Vertex AI enabled (required)
-//   PI_MEMORY_REGION      — Vertex AI region (default: "global")
-//   PI_MEMORY_EMBED_MODEL — embedding model (default: "gemini-embedding-001")
-//   PI_MEMORY_SUMMARIZE_MODEL    — summarization model (default: "claude-haiku-4-5@20251001")
-//   PI_MEMORY_SUMMARIZE_PROVIDER — "vertex" (default) or "anthropic"
-//   PI_MEMORY_EMBED_DIMS  — embedding dimensions (default: 768)
-//   PI_MEMORY_DB_PATH     — database file path (default: ~/.pi/agent/memory/memory.db)
+// Shared Vertex config (when either provider targets Vertex):
+//   ANTHROPIC_VERTEX_PROJECT_ID  — GCP project (falls back to GOOGLE_CLOUD_PROJECT)
+//   GOOGLE_CLOUD_LOCATION        — Vertex region (falls back to CLOUD_ML_REGION, default: "global")
+//
+// Embedding:
+//   PI_MEMORY_EMBED_PROVIDER  — "vertex" (default) | "ollama"
+//   PI_MEMORY_EMBED_MODEL     — default: "gemini-embedding-001"
+//   PI_MEMORY_EMBED_DIMS      — default: 768
+//   PI_MEMORY_OLLAMA_URL      — default: "http://localhost:11434"
+//
+// Summarization:
+//   PI_MEMORY_SUMMARIZE_PROVIDER — "vertex-anthropic" (default) | "vertex-google" | "anthropic"
+//   PI_MEMORY_SUMMARIZE_MODEL    — default: "claude-haiku-4-5@20251001"
+//   ANTHROPIC_API_KEY            — required when summarizeProvider is "anthropic"
+//
+// Other:
+//   PI_MEMORY_DB_PATH — default: ~/.pi/agent/memory/memory.db
 // ---------------------------------------------------------------------------
 
+const validSummarizeProviders = ["vertex-anthropic", "vertex-google", "anthropic"] as const;
+type SummarizeProvider = typeof validSummarizeProviders[number];
+
+function parseSummarizeProvider(val: string | undefined): SummarizeProvider {
+  if (val && (validSummarizeProviders as readonly string[]).includes(val)) {
+    return val as SummarizeProvider;
+  }
+  return "vertex-anthropic";
+}
+
 const CONFIG: Config = {
-  gcpProject: process.env.GOOGLE_CLOUD_PROJECT ?? "",
-  region: process.env.PI_MEMORY_REGION || "global",
-  embeddingModel: process.env.PI_MEMORY_EMBED_MODEL || "gemini-embedding-001",
+  gcpProject: process.env.ANTHROPIC_VERTEX_PROJECT_ID ?? process.env.GOOGLE_CLOUD_PROJECT ?? "",
+  region: process.env.GOOGLE_CLOUD_LOCATION ?? process.env.CLOUD_ML_REGION ?? "global",
+
+  embedProvider: process.env.PI_MEMORY_EMBED_PROVIDER === "ollama" ? "ollama" : "vertex",
+  embedModel: process.env.PI_MEMORY_EMBED_MODEL || "gemini-embedding-001",
+  embedDims: Number(process.env.PI_MEMORY_EMBED_DIMS) || 768,
+  ollamaUrl: process.env.PI_MEMORY_OLLAMA_URL || "http://localhost:11434",
+
+  summarizeProvider: parseSummarizeProvider(process.env.PI_MEMORY_SUMMARIZE_PROVIDER),
   summarizeModel: process.env.PI_MEMORY_SUMMARIZE_MODEL || "claude-haiku-4-5@20251001",
-  summarizeProvider: (process.env.PI_MEMORY_SUMMARIZE_PROVIDER === "anthropic" ? "anthropic" : "vertex") as "vertex" | "anthropic",
-  embeddingDims: Number(process.env.PI_MEMORY_EMBED_DIMS) || 768,
-  dbPath:
-    process.env.PI_MEMORY_DB_PATH ||
-    path.join(os.homedir(), ".pi", "agent", "memory", "memory.db"),
+
+  dbPath: process.env.PI_MEMORY_DB_PATH || path.join(os.homedir(), ".pi", "agent", "memory", "memory.db"),
 };
 
 // ---------------------------------------------------------------------------
@@ -423,10 +446,13 @@ export default function (pi: ExtensionAPI) {
     conversationBuffer = [];
     namingComplete = !!pi.getSessionName(); // skip if already named from a prior run
 
-    if (!CONFIG.gcpProject) {
+    const needsVertex = CONFIG.embedProvider === "vertex"
+      || CONFIG.summarizeProvider === "vertex-anthropic"
+      || CONFIG.summarizeProvider === "vertex-google";
+    if (needsVertex && !CONFIG.gcpProject) {
       console.error(
-        "[memory] GOOGLE_CLOUD_PROJECT env var is not set. " +
-        "Set it to a GCP project with Vertex AI enabled. " +
+        "[memory] ANTHROPIC_VERTEX_PROJECT_ID (or GOOGLE_CLOUD_PROJECT) is not set. " +
+        "Required when embedProvider or summarizeProvider targets Vertex. " +
         "Memory extension disabled.",
       );
       dbReady = false;
