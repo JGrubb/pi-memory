@@ -935,3 +935,68 @@ export async function getStats(dbPath: string): Promise<{
     newestTimestamp: newest.t,
   };
 }
+
+// ---------------------------------------------------------------------------
+// Obsidian backup — fetch all named sessions and their memories
+// ---------------------------------------------------------------------------
+
+/**
+ * Return all named sessions across all projects, ordered by project then time.
+ * Used for Obsidian vault backup.
+ */
+export async function getAllNamedSessions(dbPath: string): Promise<SessionRecord[]> {
+  const db = getDb(dbPath);
+  const rows = db
+    .prepare(
+      `SELECT id, cwd, session_file, name, main_topic, sub_topic, description, files_touched, resources, timestamp, named_at
+       FROM sessions
+       WHERE name IS NOT NULL
+       ORDER BY cwd, timestamp ASC`,
+    )
+    .all() as any[];
+
+  return rows.map((r) => ({
+    id: r.id,
+    cwd: r.cwd,
+    sessionFile: r.session_file ?? null,
+    name: r.name,
+    mainTopic: r.main_topic ?? null,
+    subTopic: r.sub_topic ?? null,
+    description: r.description ?? null,
+    filesTouched: safeJsonParse(r.files_touched, []),
+    resources: safeJsonParse(r.resources, []),
+    timestamp: r.timestamp,
+    namedAt: r.named_at ?? null,
+  }));
+}
+
+/**
+ * Return all complete memories for a given session, ordered by time.
+ * Used for Obsidian vault backup.
+ */
+export async function getMemoriesForSession(dbPath: string, sessionId: string): Promise<SearchResult[]> {
+  const db = getDb(dbPath);
+  const rows = db
+    .prepare(
+      `SELECT id, session_id, summary, cwd, timestamp, topics, files_touched, resources, user_prompt, type, content
+       FROM memories
+       WHERE session_id = ? AND type = 'memory' AND status = 'complete'
+       ORDER BY timestamp ASC`,
+    )
+    .all(sessionId) as any[];
+
+  return rows.map((r) => ({
+    id: r.id,
+    sessionId: r.session_id ?? null,
+    summary: r.summary,
+    cwd: r.cwd,
+    timestamp: r.timestamp,
+    topics: safeJsonParse(r.topics, []),
+    filesTouched: safeJsonParse(r.files_touched, []),
+    resources: safeJsonParse<Resource[]>(r.resources, []),
+    userPrompt: r.user_prompt ?? "",
+    distance: 0,
+    type: r.type as MemoryType,
+    content: r.content ?? null,
+  }));
+}

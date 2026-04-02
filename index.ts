@@ -5,10 +5,11 @@ import { randomUUID } from "node:crypto";
 import * as os from "node:os";
 import * as path from "node:path";
 
-import { initDb, insertMemory, searchByVector, getStats, getPendingRecords, updateMemoryAfterRetry, upsertSession, updateSessionName, findSimilarSessions, getBackfillCandidates, appendSessionInfoToJSONL, getSessionMemoriesForSummary, updateSessionDescription } from "./db.js";
+import { initDb, insertMemory, searchByVector, getStats, getPendingRecords, updateMemoryAfterRetry, upsertSession, updateSessionName, findSimilarSessions, getBackfillCandidates, appendSessionInfoToJSONL, getSessionMemoriesForSummary, updateSessionDescription, getAllNamedSessions, getMemoriesForSession } from "./db.js";
 import { embedText, summarizeInteraction, nameSession, summarizeSession } from "./vertex.js";
 import { buildSessionContext, formatSearchResults } from "./context.js";
-import type { Config, MemoryRecord, ExtractedContent, Resource, ResourceType } from "./types.js";
+import type { Config, MemoryRecord, ExtractedContent, Resource, ResourceType, SessionRecord, SearchResult } from "./types.js";
+import * as fs from "node:fs";
 
 // ---------------------------------------------------------------------------
 // Config — env vars. GCP vars are shared with the claude-vertex extension.
@@ -428,6 +429,86 @@ async function performSessionNaming(
 }
 
 // ---------------------------------------------------------------------------
+// Obsidian backup
+// ---------------------------------------------------------------------------
+
+function buildObsidianNote(session: SessionRecord, memories: SearchResult[], project: string): string {
+  // Aggregate topics, files, resources across all memories
+  const allTopics = new Set<string>(session.mainTopic ? [session.mainTopic] : []);
+  const allFiles = new Set<string>(session.filesTouched);
+  const allResources = new Map<string, Resource>();
+  for (const r of session.resources) allResources.set(r.uri, r);
+
+  for (const m of memories) {
+    for (const t of m.topics) allTopics.add(t);
+    for (const f of m.filesTouched) allFiles.add(f);
+    for (const r of m.resources) allResources.set(r.uri, r);
+  }
+
+  const date = new Date(session.timestamp).toISOString().slice(0, 10);
+
+  // --- Frontmatter ---
+  const fm: string[] = ["---"];
+  fm.push(`date: ${date}`);
+  fm.push(`project: ${project}`);
+  fm.push(`session_id: ${session.id}`);
+  if (session.name) fm.push(`name: "${session.name.replace(/"/g, "'")}"`); 
+  if (session.mainTopic) fm.push(`main_topic: ${session.mainTopic}`);
+  if (session.subTopic) fm.push(`sub_topic: ${session.subTopic}`);
+
+  if (allTopics.size > 0) {
+    const topicList = Array.from(allTopics).map((t) => `"${t}"`).join(", ");
+    fm.push(`topics: [${topicList}]`);
+  }
+
+  if (allFiles.size > 0) {
+    fm.push("files:");
+    for (const f of allFiles) fm.push(`  - ${f}`);
+  }
+
+  if (allResources.size > 0) {
+    fm.push("resources:");
+    for (const r of allResources.values()) {
+      fm.push(`  - type: ${r.type}`);
+      fm.push(`    uri: "${r.uri}"`);
+      if (r.label) fm.push(`    label: "${r.label.replace(/"/g, "'")}"`);
+    }
+  }
+
+  fm.push("---");
+
+  // --- Body ---
+  const lines: string[] = [...fm, ""];
+
+  lines.push(`# ${session.name ?? "Unnamed Session"}`, "");
+
+  if (session.description) {
+    lines.push(session.description, "");
+  }
+
+  lines.push("## Memories", "");
+
+  for (const m of memories) {
+    const time = new Date(m.timestamp).toLocaleTimeString([], {
+      hour: "2-digit",
+      minute: "2-digit",
+      hour12: false,
+    });
+    lines.push(`### ${time}`, "");
+    lines.push(m.summary, "");
+
+    if (m.userPrompt) {
+      const prompt = m.userPrompt.slice(0, 500).replace(/\n+/g, " ").trim();
+      lines.push(`**Prompt:** ${prompt}`, "");
+    }
+
+    lines.push("---", "");
+  }
+
+  return lines.join("\n");
+}
+
+// ---------------------------------------------------------------------------
 // Extension
 // ---------------------------------------------------------------------------
 
@@ -840,6 +921,62 @@ export default function (pi: ExtensionAPI) {
   // -------------------------------------------------------------------------
   // Command: /memory
   // -------------------------------------------------------------------------
+
+  pi.registerCommand("memory-backup", {
+    description: "Backup all pi memories to Obsidian vault as markdown files",
+    handler: async (_args, ctx) => {
+      if (!dbReady) {
+        ctx.ui.notify("Memory system not initialized", "warning");
+        return;
+      }
+
+      const vaultPath =
+        process.env.PI_MEMORY_OBSIDIAN_PATH ??
+        path.join(os.homedir(), "Documents", "obsidian", "v2025");
+      const backupDir = path.join(vaultPath, "pi-memories");
+
+      try {
+        const sessions = await getAllNamedSessions(CONFIG.dbPath);
+        if (sessions.length === 0) {
+          ctx.ui.notify("No named sessions to back up", "info");
+          return;
+        }
+
+        let written = 0;
+        let skipped = 0;
+
+        for (const session of sessions) {
+          const memories = await getMemoriesForSession(CONFIG.dbPath, session.id);
+          if (memories.length === 0) {
+            skipped++;
+            continue;
+          }
+
+          const project = path.basename(session.cwd);
+          const projectDir = path.join(backupDir, project);
+          fs.mkdirSync(projectDir, { recursive: true });
+
+          const dateStr = new Date(session.timestamp).toISOString().slice(0, 10);
+          const safeName = (session.name ?? session.id.slice(0, 8))
+            .replace(/[\/\\:*?"<>|]/g, "-")
+            .slice(0, 80)
+            .trim();
+          const filePath = path.join(projectDir, `${dateStr} - ${safeName}.md`);
+
+          fs.writeFileSync(filePath, buildObsidianNote(session, memories, project), "utf-8");
+          written++;
+        }
+
+        ctx.ui.notify(
+          `✅ Backed up ${written} session${written === 1 ? "" : "s"} to ${backupDir}` +
+          (skipped > 0 ? ` (${skipped} skipped — no memories yet)` : ""),
+          "info",
+        );
+      } catch (err) {
+        ctx.ui.notify(`❌ Backup failed: ${err}`, "error");
+      }
+    },
+  });
 
   pi.registerCommand("memory", {
     description: "Show memory system stats and recent memories",
