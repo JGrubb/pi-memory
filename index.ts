@@ -595,48 +595,6 @@ export default function (pi: ExtensionAPI) {
   });
 
   // -------------------------------------------------------------------------
-  // Session switch (/new, /resume): rebuild context
-  // -------------------------------------------------------------------------
-
-  pi.on("session_switch", async (_event, ctx) => {
-    injectedThisSession = false;
-    previousSessionId = currentSessionId;
-    currentSessionId = ctx.sessionManager.getSessionId() ?? randomUUID();
-    currentCwd = ctx.cwd;
-    agentEndCount = 0;
-    conversationBuffer = [];
-    namingComplete = !!pi.getSessionName();
-
-    if (!dbReady) return;
-
-    // Register the new session (no-op if already present, preserves existing name)
-    await upsertSession(CONFIG.dbPath, {
-      id: currentSessionId,
-      cwd: ctx.cwd,
-      sessionFile: ctx.sessionManager.getSessionFile() ?? null,
-      name: null,
-      mainTopic: null,
-      subTopic: null,
-      timestamp: Date.now(),
-      namedAt: null,
-    }).catch((err) => console.error("[memory] Session upsert failed:", err));
-
-    // Summarize the previous session if it has memories but no description yet
-    if (previousSessionId) {
-      summarizePreviousSession(previousSessionId).catch((err) =>
-        console.error("[memory] Previous session summarization failed:", err),
-      );
-    }
-
-    try {
-      cachedContext = await buildSessionContext(CONFIG.dbPath, ctx.cwd, currentSessionId);
-    } catch (err) {
-      console.error("[memory] Context rebuild failed:", err);
-      cachedContext = null;
-    }
-  });
-
-  // -------------------------------------------------------------------------
   // Before agent start: inject memory context on first prompt only
   // -------------------------------------------------------------------------
 
