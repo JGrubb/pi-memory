@@ -5,7 +5,7 @@ import { randomUUID } from "node:crypto";
 import * as os from "node:os";
 import * as path from "node:path";
 
-import { initDb, insertMemory, searchByVector, getStats, getPendingRecords, updateMemoryAfterRetry, upsertSession, updateSessionName, findSimilarSessions, getBackfillCandidates, appendSessionInfoToJSONL, getSessionMemoriesForSummary, updateSessionDescription, getAllNamedSessions, getMemoriesForSession } from "./db.js";
+import { initDb, insertMemory, searchByVector, getStats, getPendingRecords, updateMemoryAfterRetry, upsertSession, updateSessionName, findSimilarSessions, getBackfillCandidates, appendSessionInfoToJSONL, getSessionMemoriesForSummary, updateSessionDescription, getAllNamedSessions, getMemoriesForSession, getSessionIdByFile } from "./db.js";
 import { embedText, summarizeInteraction, nameSession, summarizeSession } from "./vertex.js";
 import { buildSessionContext, formatSearchResults } from "./context.js";
 import type { Config, MemoryRecord, ExtractedContent, Resource, ResourceType, SessionRecord, SearchResult } from "./types.js";
@@ -561,9 +561,16 @@ export default function (pi: ExtensionAPI) {
       namedAt: null,
     }).catch((err) => console.error("[memory] Session upsert failed:", err));
 
-    // Summarize the previous session if it has memories but no description yet
-    if (previousSessionId) {
-      summarizePreviousSession(previousSessionId).catch((err) =>
+    // Summarize the previous session if it has memories but no description yet.
+    // We use event.previousSessionFile (set by pi on /new, /resume, /fork) to look up
+    // the session ID reliably, since the extension is re-instantiated on every session
+    // switch so module-level previousSessionId is always null at this point.
+    const prevFile = ((_event as any).previousSessionFile as string | undefined) ?? null;
+    const resolvedPreviousSessionId = prevFile
+      ? getSessionIdByFile(CONFIG.dbPath, prevFile)
+      : previousSessionId; // fallback for in-process switches (shouldn't happen post-v0.65)
+    if (resolvedPreviousSessionId) {
+      summarizePreviousSession(resolvedPreviousSessionId).catch((err) =>
         console.error("[memory] Previous session summarization failed:", err),
       );
     }

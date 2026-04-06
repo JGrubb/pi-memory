@@ -579,6 +579,18 @@ export async function getSessionMemoriesForSummary(
 }
 
 /**
+ * Look up a session ID by its session file path.
+ * Returns null if no matching session is found.
+ */
+export function getSessionIdByFile(dbPath: string, sessionFile: string): string | null {
+  const db = getDb(dbPath);
+  const row = db
+    .prepare(`SELECT id FROM sessions WHERE session_file = ? LIMIT 1`)
+    .get(sessionFile) as { id: string } | undefined;
+  return row?.id ?? null;
+}
+
+/**
  * Store a generated description and aggregate files_touched on a session.
  */
 export async function updateSessionDescription(
