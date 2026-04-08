@@ -7,16 +7,50 @@ import type { Config } from "./types.js";
 
 let cachedToken: { token: string; expiresAt: number } | null = null;
 
+function isReauthError(error: any): boolean {
+  const stderr = error?.stderr?.toString?.() || error?.message || "";
+  return stderr.includes("Reauthentication") || stderr.includes("invalid_rapt");
+}
+
+function refreshADC(): void {
+  console.log("[memory] ADC expired — launching gcloud auth application-default login...");
+  execSync("gcloud auth application-default login --quiet", {
+    encoding: "utf-8",
+    timeout: 120_000, // 2 minutes for user to complete browser auth
+    stdio: "inherit",
+  });
+}
+
+function fetchToken(): string {
+  return execSync("gcloud auth application-default print-access-token", {
+    encoding: "utf-8",
+    timeout: 10_000,
+  }).trim();
+}
+
 export function getAccessToken(): string {
   if (cachedToken && Date.now() < cachedToken.expiresAt) {
     return cachedToken.token;
   }
-  const token = execSync("gcloud auth application-default print-access-token", {
-    encoding: "utf-8",
-    timeout: 10_000,
-  }).trim();
-  cachedToken = { token, expiresAt: Date.now() + 45 * 60 * 1000 };
-  return token;
+  try {
+    const token = fetchToken();
+    cachedToken = { token, expiresAt: Date.now() + 45 * 60 * 1000 };
+    return token;
+  } catch (error: any) {
+    if (!isReauthError(error)) throw error;
+    // Reauth needed — fire off browser-based login flow, then retry
+    try {
+      refreshADC();
+    } catch {
+      throw new Error(
+        "Automatic re-authentication failed. Please run manually:\n" +
+        "  gcloud auth application-default login",
+      );
+    }
+    const token = fetchToken();
+    cachedToken = { token, expiresAt: Date.now() + 45 * 60 * 1000 };
+    return token;
+  }
 }
 
 export function clearTokenCache(): void {
