@@ -43,6 +43,18 @@ function parseSummarizeProvider(val: string | undefined): SummarizeProvider {
   return "vertex-anthropic";
 }
 
+function getDefaultSummarizeModel(provider: SummarizeProvider): string {
+  switch (provider) {
+    case "anthropic":
+      return "claude-haiku-4-5-20251001";
+    case "vertex-anthropic":
+    case "vertex-google":
+      return "claude-haiku-4-5@20251001";
+  }
+}
+
+const summarizeProvider = parseSummarizeProvider(process.env.PI_MEMORY_SUMMARIZE_PROVIDER);
+
 const CONFIG: Config = {
   gcpProject: process.env.ANTHROPIC_VERTEX_PROJECT_ID ?? process.env.GOOGLE_CLOUD_PROJECT ?? "",
   region: process.env.GOOGLE_CLOUD_LOCATION ?? process.env.CLOUD_ML_REGION ?? "global",
@@ -52,8 +64,8 @@ const CONFIG: Config = {
   embedDims: Number(process.env.PI_MEMORY_EMBED_DIMS) || 768,
   ollamaUrl: process.env.PI_MEMORY_OLLAMA_URL || "http://localhost:11434",
 
-  summarizeProvider: parseSummarizeProvider(process.env.PI_MEMORY_SUMMARIZE_PROVIDER),
-  summarizeModel: process.env.PI_MEMORY_SUMMARIZE_MODEL || "claude-haiku-4-5@20251001",
+  summarizeProvider,
+  summarizeModel: process.env.PI_MEMORY_SUMMARIZE_MODEL || getDefaultSummarizeModel(summarizeProvider),
 
   dbPath: process.env.PI_MEMORY_DB_PATH || path.join(os.homedir(), ".pi", "agent", "memory", "memory.db"),
 };
