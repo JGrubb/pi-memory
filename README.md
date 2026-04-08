@@ -28,12 +28,13 @@ This means the agent can answer questions like *"did we already add auth to this
 ## Installation
 
 ```bash
-# Clone into pi's extensions directory
-git clone https://github.com/JGrubb/pi-memory.git ~/.pi/agent/extensions/memory
+pi install git:github.com/JGrubb/pi-memory
+```
 
-# Install dependencies
-cd ~/.pi/agent/extensions/memory
-npm install
+Or to install for the current project only:
+
+```bash
+pi install -l git:github.com/JGrubb/pi-memory
 ```
 
 ## Configuration
