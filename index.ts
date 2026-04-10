@@ -1,6 +1,7 @@
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Box, Text } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
+import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -10,6 +11,25 @@ import { embedText, summarizeInteraction, nameSession, summarizeSession } from "
 import { buildSessionContext, formatSearchResults } from "./context.js";
 import type { Config, MemoryRecord, ExtractedContent, Resource, ResourceType, SessionRecord, SearchResult } from "./types.js";
 import * as fs from "node:fs";
+
+// ---------------------------------------------------------------------------
+// Resolve the effective project root for a given cwd.
+// If the directory is inside a git repo, normalize to the repo root so that
+// sessions started from any subdirectory share the same memory scope.
+// Falls back to the raw cwd when not in a git repo (e.g. a scratch folder).
+// ---------------------------------------------------------------------------
+function resolveProjectCwd(cwd: string): string {
+  try {
+    const root = execFileSync("git", ["rev-parse", "--show-toplevel"], {
+      cwd,
+      stdio: ["pipe", "pipe", "pipe"],
+      encoding: "utf8",
+    }).trim();
+    return root;
+  } catch {
+    return cwd;
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Config — env vars. GCP vars are shared with the claude-vertex extension.
@@ -534,7 +554,7 @@ export default function (pi: ExtensionAPI) {
     cachedContext = null;
     previousSessionId = currentSessionId;
     currentSessionId = ctx.sessionManager.getSessionId() ?? randomUUID();
-    currentCwd = ctx.cwd;
+    currentCwd = resolveProjectCwd(ctx.cwd);
     agentEndCount = 0;
     conversationBuffer = [];
     namingComplete = !!pi.getSessionName(); // skip if already named from a prior run
@@ -564,7 +584,7 @@ export default function (pi: ExtensionAPI) {
     // Register this session in the sessions table (no-op if already present)
     await upsertSession(CONFIG.dbPath, {
       id: currentSessionId,
-      cwd: ctx.cwd,
+      cwd: currentCwd,
       sessionFile: ctx.sessionManager.getSessionFile() ?? null,
       name: null,
       mainTopic: null,
@@ -588,7 +608,7 @@ export default function (pi: ExtensionAPI) {
     }
 
     try {
-      cachedContext = await buildSessionContext(CONFIG.dbPath, ctx.cwd, currentSessionId);
+      cachedContext = await buildSessionContext(CONFIG.dbPath, currentCwd, currentSessionId);
       if (cachedContext) {
         const stats = await getStats(CONFIG.dbPath);
         ctx.ui.notify(
@@ -652,7 +672,7 @@ export default function (pi: ExtensionAPI) {
     if (!dbReady) return;
 
     const messages = event.messages;
-    const cwd = ctx.cwd;
+    const cwd = currentCwd ?? ctx.cwd;
     const sessionId = currentSessionId ?? "unknown";
 
     // Accumulate messages for session naming
