@@ -297,12 +297,12 @@ async function processAndStore(
   }
 
   // Step 2: Embed the summary
-  let embedding: Float32Array;
+  let embedding: Float32Array | null;
   try {
     embedding = await embedText(summary, CONFIG, "RETRIEVAL_DOCUMENT");
   } catch (err) {
     console.error("[memory] Embedding failed, will retry on next session start:", err);
-    embedding = new Float32Array(CONFIG.embeddingDims);
+    embedding = null;
     if (status === "complete") status = "pending_embed";
   }
 
@@ -881,11 +881,11 @@ export default function (pi: ExtensionAPI) {
       const display = params.label ? `${params.label} (${params.uri})` : params.uri;
       const summaryText = `Pinned resource: ${display}`;
 
-      let embedding: Float32Array;
+      let embedding: Float32Array | null;
       try {
         embedding = await embedText(summaryText, CONFIG, "RETRIEVAL_DOCUMENT");
       } catch {
-        embedding = new Float32Array(CONFIG.embeddingDims);
+        embedding = null;
       }
 
       const record: MemoryRecord = {

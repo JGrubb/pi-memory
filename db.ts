@@ -190,7 +190,7 @@ export async function initDb(dbPath: string): Promise<void> {
 export async function insertMemory(
   dbPath: string,
   record: MemoryRecord,
-  embedding: Float32Array,
+  embedding: Float32Array | null,
 ): Promise<void> {
   const db = getDb(dbPath);
   const trx = db.transaction(() => {
@@ -234,26 +234,30 @@ export async function insertMemory(
       .prepare("SELECT rowid FROM memories WHERE id = ?")
       .get(record.id) as { rowid: number };
 
-    // Upsert into vec0 table — vec0 doesn't support UPDATE, so delete + re-insert.
-    // The DELETE may throw SQLITE_DONE under certain runtime contexts (a sqlite-vec
-    // bug when the native extension is loaded in node:test + tsx). This is safe to
-    // ignore — it just means "no rows deleted", which happens on the first insert.
-    try {
-      db.prepare("DELETE FROM vec_memories WHERE rowid = ?").run(row.rowid);
-    } catch (e: any) {
-      if (e.code !== "SQLITE_DONE") throw e;
-    }
-    // If DELETE failed silently (SQLITE_DONE bug), the old row may still exist.
-    // Try INSERT; if it fails with UNIQUE constraint, the embedding is unchanged
-    // which is acceptable for an upsert with the same embedding.
-    try {
-      db.prepare(
-        "INSERT INTO vec_memories(rowid, embedding, cwd) VALUES (?, ?, ?)",
-      ).run(BigInt(row.rowid), vecBuf(embedding), record.cwd);
-    } catch (e: any) {
-      // If the row already exists (DELETE didn't actually remove it), that's OK
-      // for the upsert case — the embedding data is the same.
-      if (!e.message?.includes("UNIQUE constraint")) throw e;
+    // Upsert into vec0 table — skip entirely when embedding is null (pending_embed
+    // status), so we don't insert a zero-length vector that sqlite-vec rejects.
+    if (embedding !== null) {
+      // vec0 doesn't support UPDATE, so delete + re-insert.
+      // The DELETE may throw SQLITE_DONE under certain runtime contexts (a sqlite-vec
+      // bug when the native extension is loaded in node:test + tsx). This is safe to
+      // ignore — it just means "no rows deleted", which happens on the first insert.
+      try {
+        db.prepare("DELETE FROM vec_memories WHERE rowid = ?").run(row.rowid);
+      } catch (e: any) {
+        if (e.code !== "SQLITE_DONE") throw e;
+      }
+      // If DELETE failed silently (SQLITE_DONE bug), the old row may still exist.
+      // Try INSERT; if it fails with UNIQUE constraint, the embedding is unchanged
+      // which is acceptable for an upsert with the same embedding.
+      try {
+        db.prepare(
+          "INSERT INTO vec_memories(rowid, embedding, cwd) VALUES (?, ?, ?)",
+        ).run(BigInt(row.rowid), vecBuf(embedding), record.cwd);
+      } catch (e: any) {
+        // If the row already exists (DELETE didn't actually remove it), that's OK
+        // for the upsert case — the embedding data is the same.
+        if (!e.message?.includes("UNIQUE constraint")) throw e;
+      }
     }
   });
 
