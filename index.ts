@@ -1,6 +1,7 @@
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Box, Text } from "@mariozechner/pi-tui";
-import { Type } from "@sinclair/typebox";
+import { Type } from "typebox";
+import { StringEnum } from "@mariozechner/pi-ai";
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import * as os from "node:os";
@@ -849,18 +850,9 @@ export default function (pi: ExtensionAPI) {
     ],
     parameters: Type.Object({
       uri: Type.String({ description: "Canonical identifier: full URL, Jira key, BQ table name, etc." }),
-      type: Type.Union(
-        [
-          Type.Literal("url"),
-          Type.Literal("confluence"),
-          Type.Literal("jira"),
-          Type.Literal("metabase"),
-          Type.Literal("grafana"),
-          Type.Literal("bigquery"),
-          Type.Literal("other"),
-        ],
-        { description: "Resource type" },
-      ),
+      type: StringEnum(["url", "confluence", "jira", "metabase", "grafana", "bigquery", "other"] as const, {
+        description: "Resource type",
+      }),
       label: Type.Optional(
         Type.String({ description: "Human-readable title, e.g. 'INFRA-1234: Fix provisioner bug'" }),
       ),
